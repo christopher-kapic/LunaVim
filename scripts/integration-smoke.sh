@@ -18,6 +18,11 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+if ! command -v tree-sitter >/dev/null 2>&1; then
+  echo "[integration-smoke] missing required dependency: tree-sitter CLI" >&2
+  exit 1
+fi
+
 TMP="$(mktemp -d -t lvim-integration-XXXXXX)"
 cleanup() {
   if [[ -n "${TMP:-}" && -d "$TMP" ]]; then
@@ -381,6 +386,11 @@ fi
 
 if ! grep -q "^INTEGRATION_OK$" "$LOG"; then
   echo "[integration-smoke] driver did not reach INTEGRATION_OK" >&2
+  exit 1
+fi
+
+if grep -Eq 'Plugin .+ is not installed|Error during "tree-sitter build"' "$LOG"; then
+  echo "[integration-smoke] runtime log contains bootstrap or treesitter build errors" >&2
   exit 1
 fi
 

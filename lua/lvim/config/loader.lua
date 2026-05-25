@@ -10,10 +10,7 @@ function M.load_user_config()
   local path = config_dir .. "/config.lua"
 
   if not file_exists(path) then
-    vim.notify(
-      string.format("No user config at %s; create one to customize.", path),
-      vim.log.levels.INFO
-    )
+    vim.notify(string.format("No user config at %s; create one to customize.", path), vim.log.levels.INFO)
     return false
   end
 
@@ -28,10 +25,7 @@ function M.load_user_config()
 
   local ok, run_err = pcall(chunk)
   if not ok then
-    vim.notify(
-      string.format("Error running user config %s: %s", path, tostring(run_err)),
-      vim.log.levels.ERROR
-    )
+    vim.notify(string.format("Error running user config %s: %s", path, tostring(run_err)), vim.log.levels.ERROR)
     return false
   end
 

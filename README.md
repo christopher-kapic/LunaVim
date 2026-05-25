@@ -17,8 +17,8 @@ surfaces are still `lvim` — old muscle memory carries over.
   `:Lvim*` commands, and the same `~/.config/lvim/config.lua` entry
   point.
 - Built on a current plugin set: `lazy.nvim`, `mason.nvim` +
-  `nvim-lspconfig`, `blink.cmp`, `nvim-treesitter`, `telescope.nvim`,
-  `nvim-tree.lua`, `gitsigns.nvim`, `which-key.nvim`, `lualine.nvim`,
+  `nvim-lspconfig`, `nvim-treesitter`, `telescope.nvim`, `nvim-tree.lua`,
+  `gitsigns.nvim`, `which-key.nvim`, `lualine.nvim`,
   `bufferline.nvim`, `toggleterm.nvim`, `mini.comment`,
   `indent-blankline.nvim`.
 - Linux and macOS supported today.
@@ -27,8 +27,8 @@ surfaces are still `lvim` — old muscle memory carries over.
 
 - **Neovim 0.11 or newer** (`nvim --version`).
 - **git** on `PATH`.
-- A C compiler (`cc` / `gcc` / `clang`) — `nvim-treesitter` needs it to
-  build parsers.
+- A C compiler (`cc` / `gcc` / `clang`) and the `tree-sitter` CLI —
+  `nvim-treesitter` needs both to build and update parsers.
 - **Optional but recommended:**
   - [`ripgrep`](https://github.com/BurntSushi/ripgrep) (`rg`) — used by
     telescope's live grep.
@@ -45,15 +45,14 @@ One-liner (downloads and runs [`scripts/install.sh`](scripts/install.sh)):
 curl -L https://raw.githubusercontent.com/christopher-kapic/LunaVim/main/scripts/install.sh | bash
 ```
 
-This clones LunaVim into `~/.local/share/lunavim` and writes the `lvim`
-launcher to `~/.local/bin/lvim`. Make sure `~/.local/bin` is on your
-`PATH`, then run:
+This clones LunaVim into `~/.local/share/lunavim`, installs the core
+plugin set, and writes the `lvim` launcher to `~/.local/bin/lvim`. Make
+sure `~/.local/bin` is on your `PATH`, then run:
 
 ```bash
 lvim
 ```
 
-On first launch, `lazy.nvim` installs the core plugin set automatically.
 
 If the installer detects an existing LunarVim or CKLunarVim install (or
 any foreign `~/.local/bin/lvim` launcher), it refuses to overwrite the
@@ -116,7 +115,7 @@ Minimal example:
 -- ~/.config/lvim/config.lua
 
 lvim.leader = "space"
-lvim.colorscheme = "lunar"
+lvim.colorscheme = "tokyonight"
 lvim.format_on_save = true
 
 -- Toggle a built-in module
@@ -141,7 +140,7 @@ Useful commands:
 | Command                 | Effect                                            |
 | ----------------------- | ------------------------------------------------- |
 | `:LvimInfo`             | Show paths, versions, and active config.          |
-| `:LvimReload`           | Reapply options, keymaps, and the plugin spec.    |
+| `:LvimReload`           | Reload config, then reapply options, keymaps, and autocmds. |
 | `:LvimUpdate`           | Pull the latest LunaVim (git pull --rebase).      |
 | `:LvimSyncCorePlugins`  | Apply the pinned plugin snapshot.                 |
 | `:LvimCacheReset`       | Clear the lazy.nvim cache.                        |

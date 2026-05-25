@@ -6,7 +6,7 @@ test:
 lint:
 	stylua --check lua/
 	selene lua/
-	shellcheck scripts/*.sh bin/lvim
+	if command -v shellcheck >/dev/null 2>&1; then 		shellcheck scripts/*.sh bin/lvim; 	else 		printf '%s\n' 'shellcheck not installed; falling back to shell syntax checks'; 		bash -n scripts/*.sh bin/lvim; 	fi
 
 # `make verify` is the local pre-push gate: it runs lints and then the full
 # end-to-end integration smoke (scripts/integration-smoke.sh). The integration

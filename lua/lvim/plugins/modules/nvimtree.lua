@@ -136,10 +136,11 @@ local function on_attach(bufnr)
   -- `lib` module).
   local function with_node(action)
     return function()
-      if not api.tree.get_node_under_cursor() then
+      local node = api.tree.get_node_under_cursor()
+      if not node then
         return
       end
-      action()
+      action(node)
     end
   end
 

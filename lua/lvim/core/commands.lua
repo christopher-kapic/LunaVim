@@ -82,10 +82,7 @@ local function lvim_update()
     return
   end
 
-  vim.notify(
-    string.format("LvimUpdate: git pull --rebase --autostash in %s", base),
-    vim.log.levels.INFO
-  )
+  vim.notify(string.format("LvimUpdate: git pull --rebase --autostash in %s", base), vim.log.levels.INFO)
 
   local function stream(level)
     return function(_, data)
@@ -204,12 +201,12 @@ local schedule_tsupdate = vim.schedule_wrap(function()
   if not package.loaded["nvim-treesitter"] then
     return
   end
+  if vim.fn.executable("tree-sitter") ~= 1 then
+    return
+  end
   local ok, err = pcall(vim.cmd, "TSUpdate")
   if not ok then
-    vim.notify(
-      "LvimSyncCorePlugins: TSUpdate failed (skipping parser refresh): " .. tostring(err),
-      vim.log.levels.WARN
-    )
+    vim.notify("LvimSyncCorePlugins: TSUpdate failed (skipping parser refresh): " .. tostring(err), vim.log.levels.WARN)
   end
 end)
 
@@ -255,11 +252,7 @@ local function lvim_sync_core_plugins(opts)
   local bang = opts and opts.bang
 
   if not bang then
-    local choice = vim.fn.confirm(
-      string.format("Overwrite %s with snapshot %s?", lockfile, snap_path),
-      "&Yes\n&No",
-      2
-    )
+    local choice = vim.fn.confirm(string.format("Overwrite %s with snapshot %s?", lockfile, snap_path), "&Yes\n&No", 2)
     if choice ~= 1 then
       vim.notify("LvimSyncCorePlugins cancelled", vim.log.levels.INFO)
       return
@@ -272,10 +265,7 @@ local function lvim_sync_core_plugins(opts)
 
   local wrote, write_err = write_file(lockfile, contents)
   if not wrote then
-    vim.notify(
-      string.format("LvimSyncCorePlugins: failed to write %s: %s", lockfile, write_err),
-      vim.log.levels.ERROR
-    )
+    vim.notify(string.format("LvimSyncCorePlugins: failed to write %s: %s", lockfile, write_err), vim.log.levels.ERROR)
     return
   end
 
@@ -344,6 +334,34 @@ local function lvim_cache_reset()
   vim.notify("Cache reset")
 end
 
+local function buffer_kill()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local listed = vim.fn.getbufinfo({ buflisted = 1 })
+
+  if #listed <= 1 then
+    vim.cmd("enew")
+  else
+    vim.cmd("bnext")
+    if vim.api.nvim_get_current_buf() == bufnr then
+      vim.cmd("bprevious")
+    end
+  end
+
+  if vim.api.nvim_buf_is_valid(bufnr) then
+    vim.cmd("bdelete " .. bufnr)
+  end
+end
+
+local function lvim_treesitter_info()
+  for _, cmd in ipairs({ "TSStatus", "TSConfigInfo", "TSInstallInfo" }) do
+    if vim.fn.exists(":" .. cmd) == 2 then
+      vim.cmd(cmd)
+      return
+    end
+  end
+  vim.notify("LvimTreesitterInfo: nvim-treesitter info command is unavailable", vim.log.levels.WARN)
+end
+
 -- `force = true` mirrors LunarVim's `M.load` (see the upstream
 -- reference under `references/`, `lua/lvim/core/commands.lua:92`) so
 -- a re-invocation of
@@ -361,7 +379,7 @@ end
 --      same tree buffer (nvim-tree is single-instance, so a `vsplit`
 --      clones the buffer reference). Result: `tree | tree` with the
 --      right window resized to nvim-tree's configured sidebar width
---      and focus on the main tree on the left. Open a file from either
+--      and focus kept on the new sidebar on the right. Open a file from either
 --      window and that window's buffer is replaced with the file,
 --      leaving the other as a side panel.
 --   2. Multiple tree windows (the split state from case 1) → close the
@@ -391,7 +409,6 @@ local function lvim_explorer()
     local sidebar_width = ((builtin.setup or {}).view or {}).width or 30
     vim.cmd("rightbelow vsplit")
     vim.cmd("vertical resize " .. tostring(sidebar_width))
-    vim.cmd("wincmd h")
     return
   end
 
@@ -416,6 +433,8 @@ function M.setup()
   vim.api.nvim_create_user_command("LvimReload", lvim_reload, { force = true })
   vim.api.nvim_create_user_command("LvimCacheReset", lvim_cache_reset, { force = true })
   vim.api.nvim_create_user_command("LvimExplorer", lvim_explorer, { force = true })
+  vim.api.nvim_create_user_command("BufferKill", buffer_kill, { force = true })
+  vim.api.nvim_create_user_command("LvimTreesitterInfo", lvim_treesitter_info, { force = true })
 end
 
 return M

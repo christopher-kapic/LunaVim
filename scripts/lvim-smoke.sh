@@ -4230,7 +4230,8 @@ check_phase_6_nvimtree_module_present() {
 check_phase_6_nvimtree_defaults_shape() {
   # Phase 6 step 1 prescribes the defaults subtree shape:
   #   { active = true, setup = { view = { width = 30 }, renderer = {...},
-  #                              filters = { dotfiles = false } } }
+  #                              filters = { dotfiles = false,
+  #                                          git_ignored = false } } }
   # Pin each top-level key under `setup` plus the prescribed leaf values so a
   # regression that flattened the table (or dropped one of the named subtrees)
   # surfaces here.
@@ -4238,10 +4239,45 @@ check_phase_6_nvimtree_defaults_shape() {
   cfg_dir="$(make_empty_config_dir)"
 
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
-    -c 'lua local t = lvim.builtin.nvimtree; local s = t.setup or {}; print(t.active, type(s), type(s.view), s.view and s.view.width, type(s.renderer), type(s.filters), s.filters and s.filters.dotfiles)' \
+    -c 'lua local t = lvim.builtin.nvimtree; local s = t.setup or {}; print(t.active, type(s), type(s.view), s.view and s.view.width, type(s.renderer), type(s.filters), s.filters and s.filters.dotfiles, s.filters and s.filters.git_ignored)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^true[[:space:]]+table[[:space:]]+table[[:space:]]+30[[:space:]]+table[[:space:]]+table[[:space:]]+false$' <<<"$output"; then
+  if ! grep -Eq '^true[[:space:]]+table[[:space:]]+table[[:space:]]+30[[:space:]]+table[[:space:]]+table[[:space:]]+false[[:space:]]+false$' <<<"$output"; then
     printf 'phase 6 nvimtree: lvim.builtin.nvimtree defaults shape wrong (output: %s)\n' "$output" >&2
+    return 1
+  fi
+}
+
+check_phase_6_nvimtree_lvimexplorer_focuses_new_sidebar() {
+  # Smart-toggle contract: when the only visible window is a full-screen tree,
+  # `:LvimExplorer` should create the right sidebar split and leave focus in
+  # that new sidebar window so `<leader>e` lands the cursor in the panel it
+  # just opened.
+  local cfg_dir output
+  cfg_dir="$(make_empty_config_dir)"
+
+  output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
+    -c 'lua local before = vim.api.nvim_get_current_win(); vim.bo.filetype = "NvimTree"; vim.cmd("LvimExplorer"); print("EXP", #vim.api.nvim_list_wins(), before ~= vim.api.nvim_get_current_win())' \
+    -c 'qall!' 2>&1)"
+  if ! grep -Eq '^EXP[[:space:]]+2[[:space:]]+true$' <<<"$output"; then
+    printf 'phase 6 nvimtree: LvimExplorer did not keep focus in the new sidebar window (output: %s)\n' "$output" >&2
+    return 1
+  fi
+}
+
+check_phase_6_nvimtree_on_attach_cr_passes_node() {
+  # Regression guard for LunaVim's custom in-tree mappings: the `<CR>` mapping
+  # installed by `on_attach` must pass the node returned by
+  # `api.tree.get_node_under_cursor()` into `api.node.open.edit(node)`.
+  # Calling the raw action with no node raises:
+  #   open-file.lua:446: attempt to index local 'node' (a nil value)
+  local cfg_dir output
+  cfg_dir="$(make_empty_config_dir)"
+
+  output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
+    -c 'lua local captured, got; local node = { name = "sentinel" }; package.loaded["nvim-tree"] = { setup = function(o) captured = o end }; package.loaded["nvim-tree.api"] = { tree = { get_node_under_cursor = function() return node end, change_root_to_node = function(n) got = n end }, node = { open = { edit = function(n) got = n end, vertical = function(n) got = n end }, navigate = { parent_close = function(n) got = n end } }, config = { mappings = { default_on_attach = function(_) end } } }; require("lvim.plugins.modules.nvimtree").setup({}); local bufnr = vim.api.nvim_create_buf(false, true); captured.on_attach(bufnr); vim.api.nvim_set_current_buf(bufnr); local m = vim.fn.maparg("<CR>", "n", false, true); if type(m) == "table" and type(m.callback) == "function" then m.callback() end; print("NODEMAP", got == node)' \
+    -c 'qall!' 2>&1)"
+  if ! grep -Eq '^NODEMAP[[:space:]]+true$' <<<"$output"; then
+    printf 'phase 6 nvimtree: on_attach `<CR>` mapping did not pass the current node into api.node.open.edit (output: %s)\n' "$output" >&2
     return 1
   fi
 }
@@ -6938,6 +6974,8 @@ check_phase_6_telescope_literal_acceptance_require_returns_table
 check_phase_6_telescope_toggle_drops_telescope_specifically
 check_phase_6_nvimtree_module_present
 check_phase_6_nvimtree_defaults_shape
+check_phase_6_nvimtree_lvimexplorer_focuses_new_sidebar
+check_phase_6_nvimtree_on_attach_cr_passes_node
 check_phase_6_nvimtree_setup_disables_netrw
 check_phase_6_nvimtree_setup_forwards_opts
 check_phase_6_nvimtree_setup_pcall_guards_missing

@@ -50,13 +50,7 @@ function M.toggle_lazygit()
       float_opts = { border = "double" },
       on_open = function(term)
         vim.cmd("startinsert!")
-        vim.api.nvim_buf_set_keymap(
-          term.bufnr,
-          "n",
-          "q",
-          "<cmd>close<CR>",
-          { noremap = true, silent = true }
-        )
+        vim.api.nvim_buf_set_keymap(term.bufnr, "n", "q", "<cmd>close<CR>", { noremap = true, silent = true })
       end,
     })
   end

@@ -125,11 +125,8 @@ function M.setup()
       local on_attach = lsp_cfg.on_attach or handlers.make_on_attach()
       local capabilities = lsp_cfg.capabilities or handlers.make_capabilities()
       for name, config in pairs(lsp_cfg.servers or {}) do
-        local merged = vim.tbl_deep_extend(
-          "force",
-          { on_attach = on_attach, capabilities = capabilities },
-          config or {}
-        )
+        local merged =
+          vim.tbl_deep_extend("force", { on_attach = on_attach, capabilities = capabilities }, config or {})
         vim.lsp.config(name, merged)
         vim.lsp.enable(name)
       end

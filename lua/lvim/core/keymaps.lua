@@ -113,12 +113,7 @@ function M.setup()
   -- lazy.nvim's require-interceptor loads toggleterm on that first require so
   -- no explicit `cmd`/`keys` trigger is needed for this path.
   if vim.fn.executable("lazygit") == 1 then
-    map(
-      "n",
-      "<leader>gg",
-      "<cmd>lua require('lvim.plugins.modules.terminal').toggle_lazygit()<CR>",
-      "Lazygit"
-    )
+    map("n", "<leader>gg", "<cmd>lua require('lvim.plugins.modules.terminal').toggle_lazygit()<CR>", "Lazygit")
   end
 
   local user_keys = (_G.lvim and _G.lvim.keys) or {}

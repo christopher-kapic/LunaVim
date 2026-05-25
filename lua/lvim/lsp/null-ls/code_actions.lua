@@ -20,11 +20,12 @@ local notified_stub = false
 
 local function ensure_registry()
   _G.lvim = _G.lvim or {}
-  _G.lvim._null_ls_registry = _G.lvim._null_ls_registry or {
-    formatters = {},
-    linters = {},
-    code_actions = {},
-  }
+  _G.lvim._null_ls_registry = _G.lvim._null_ls_registry
+    or {
+      formatters = {},
+      linters = {},
+      code_actions = {},
+    }
   return _G.lvim._null_ls_registry
 end
 

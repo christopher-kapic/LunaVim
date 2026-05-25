@@ -358,6 +358,17 @@ lvim.plugins = {
 CONFIG
 }
 
+prime_core_plugins() {
+  log "Installing LunaVim core plugins"
+
+  if (( DRY_RUN )); then
+    log "dry-run: nvim --headless -u $LVIM_INSTALL_DIR/init.lua -c lua require('lazy').sync({ wait = true, show = false }) -c qall!"
+    return
+  fi
+
+  LUNAVIM_BASE_DIR="$LVIM_INSTALL_DIR"     LUNAVIM_RUNTIME_DIR="$LUNAVIM_RUNTIME_DIR"     LUNAVIM_CONFIG_DIR="$LUNAVIM_CONFIG_DIR"     LUNAVIM_CACHE_DIR="$LUNAVIM_CACHE_DIR"     nvim --headless -u "$LVIM_INSTALL_DIR/init.lua"       -c "lua require('lazy').sync({ wait = true, show = false })"       -c "qall!"
+}
+
 main() {
   parse_args "$@"
   detect_os
@@ -366,13 +377,13 @@ main() {
   ensure_checkout
   install_launcher
   write_starter_config
+  prime_core_plugins
 
   log ""
   log "LunaVim install complete."
   log "Next steps:"
   log "  1. Run: lvim"
-  log "  2. Let LunaVim bootstrap plugins."
-  log "  3. Run: :checkhealth"
+  log "  2. Run: :checkhealth lvim"
 }
 
 main "$@"

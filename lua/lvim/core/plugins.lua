@@ -48,11 +48,7 @@ function M.bootstrap()
       path,
     })
     if vim.v.shell_error ~= 0 then
-      error(string.format(
-        "lvim: failed to clone lazy.nvim into %s: %s",
-        path,
-        out or ""
-      ))
+      error(string.format("lvim: failed to clone lazy.nvim into %s: %s", path, out or ""))
     end
   end
 

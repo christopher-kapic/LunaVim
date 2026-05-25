@@ -54,22 +54,18 @@ return {
   { "folke/lazy.nvim" },
 
   -- Bundled colorschemes. Both ship in the core spec so the user's
-  -- `lvim.colorscheme` resolves out of the box for either default ("lunar")
-  -- or the LunarVim-traditional "tokyonight". Lazy-loading is keyed off the
-  -- live `lvim.colorscheme`: only the matching plugin loads eagerly, the
-  -- other stays on disk-but-deferred so it can be enabled later via a
-  -- `:colorscheme` invocation without paying its startup cost upfront.
-  --
-  -- `priority = 1000` is lazy.nvim's documented convention for "load this
-  -- before other start plugins": lualine/bufferline read highlight groups
-  -- in their `event = "VeryLazy"` callbacks, and they need the colorscheme's
-  -- highlights to be live by then. Without the priority bump, lazy can
-  -- interleave loads such that lualine resolves `theme = "auto"` against
-  -- the default Neovim theme.
+  -- `lvim.colorscheme` resolves out of the box for the default "tokyonight"
+  -- and its variants. Keep both deferred: on a fresh install with
+  -- `install.missing = false`, eager start plugins emit noisy "plugin is not
+  -- installed" errors before the user has synced the core set. The theme
+  -- module (`lvim/core/theme.lua`) `require`s the selected theme explicitly,
+  -- which triggers lazy.nvim's module loader on demand once the plugin is on
+  -- disk; a later manual `:colorscheme tokyonight-*` is also handled by
+  -- lazy.nvim's colorscheme autoload path.
   --
   -- No `enabled = gate(...)` and no `config = setup(...)`: there is no
-  -- `lvim.builtin.tokyonight.active` toggle (the `lazy = ...` condition
-  -- already gates the load), and the colorscheme orchestration lives in
+  -- `lvim.builtin.tokyonight.active` toggle, and the colorscheme
+  -- orchestration lives in
   -- `lvim/core/theme.lua` which runs from `lvim.start()` after lazy is up
   -- rather than via lazy's per-plugin `config` hook. Putting the
   -- `plugin.setup(opts)` call in a lazy `config` callback would race the
@@ -81,8 +77,7 @@ return {
   -- different scheme can add it via `lvim.plugins` and set `lvim.colorscheme`.
   {
     "folke/tokyonight.nvim",
-    lazy = not vim.startswith((_G.lvim and _G.lvim.colorscheme) or "", "tokyonight"),
-    priority = 1000,
+    lazy = true,
   },
 
   -- Lua-utility library; consumed by telescope and other plugins via
@@ -278,16 +273,20 @@ return {
   -- a nil node `main` no longer produces. `main` ships with a totally
   -- different config surface; the module under
   -- `lvim/plugins/modules/treesitter.lua` feature-probes both and
-  -- dispatches accordingly. `build` is wrapped in `pcall` so the
-  -- `:TSUpdate` command (master only) doesn't error the install on
-  -- the `main` branch where parsers are managed differently.
+  -- dispatches accordingly. `build` is gated on the `tree-sitter` CLI.
+  -- Both the legacy and current nvim-treesitter install paths shell out to
+  -- the CLI during parser builds, so skip quietly when it is absent and let
+  -- `:checkhealth lvim` surface the prerequisite instead of spraying
+  -- install-time stderr.
   {
     "nvim-treesitter/nvim-treesitter",
     name = "treesitter",
     enabled = gate("treesitter"),
     branch = vim.fn.has("nvim-0.12") == 1 and "main" or "master",
     build = function()
-      pcall(vim.cmd, "TSUpdate")
+      if vim.fn.executable("tree-sitter") == 1 then
+        pcall(vim.cmd, "TSUpdate")
+      end
     end,
     event = { "BufReadPost", "BufNewFile" },
     opts = {},

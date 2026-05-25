@@ -93,7 +93,12 @@ return {
             },
           },
         },
-        filters = { dotfiles = false },
+        -- Show gitignored files in-tree so nvim-tree can render them with its
+        -- ignored-file highlight instead of filtering them out entirely.
+        filters = {
+          dotfiles = false,
+          git_ignored = false,
+        },
       },
     },
     -- Statusline. The whole subtree (minus `active`) is forwarded to
@@ -249,7 +254,11 @@ return {
         { "<leader>;", "<cmd>Alpha<CR>", desc = "Dashboard" },
         { "<leader>w", "<cmd>w!<CR>", desc = "Save" },
         { "<leader>q", "<cmd>confirm q<CR>", desc = "Quit" },
-        { "<leader>/", "<Plug>(comment_toggle_linewise_current)", desc = "Comment toggle current line" },
+        {
+          "<leader>/",
+          "<cmd>lua require('mini.comment').toggle_lines(vim.api.nvim_win_get_cursor(0)[1], vim.api.nvim_win_get_cursor(0)[1])<CR>",
+          desc = "Comment toggle current line",
+        },
         { "<leader>c", "<cmd>BufferKill<CR>", desc = "Close Buffer" },
         { "<leader>f", "<cmd>Telescope find_files<CR>", desc = "Find File" },
         { "<leader>h", "<cmd>nohlsearch<CR>", desc = "No Highlight" },
@@ -297,8 +306,16 @@ return {
         -- Git (gitsigns + telescope-git pickers + lazygit float)
         { "<leader>g", group = "Git" },
         { "<leader>gg", "<cmd>lua require('lvim.plugins.modules.terminal').toggle_lazygit()<cr>", desc = "Lazygit" },
-        { "<leader>gj", "<cmd>lua require 'gitsigns'.nav_hunk('next', {navigation_message = false})<cr>", desc = "Next Hunk" },
-        { "<leader>gk", "<cmd>lua require 'gitsigns'.nav_hunk('prev', {navigation_message = false})<cr>", desc = "Prev Hunk" },
+        {
+          "<leader>gj",
+          "<cmd>lua require 'gitsigns'.nav_hunk('next', {navigation_message = false})<cr>",
+          desc = "Next Hunk",
+        },
+        {
+          "<leader>gk",
+          "<cmd>lua require 'gitsigns'.nav_hunk('prev', {navigation_message = false})<cr>",
+          desc = "Prev Hunk",
+        },
         { "<leader>gl", "<cmd>lua require 'gitsigns'.blame_line()<cr>", desc = "Blame" },
         { "<leader>gL", "<cmd>lua require 'gitsigns'.blame_line({full=true})<cr>", desc = "Blame Line (full)" },
         { "<leader>gp", "<cmd>lua require 'gitsigns'.preview_hunk()<cr>", desc = "Preview Hunk" },
@@ -341,10 +358,14 @@ return {
         { "<leader>sk", "<cmd>Telescope keymaps<cr>", desc = "Keymaps" },
         { "<leader>sC", "<cmd>Telescope commands<cr>", desc = "Commands" },
         { "<leader>sl", "<cmd>Telescope resume<cr>", desc = "Resume last search" },
-        { "<leader>sp", "<cmd>lua require('telescope.builtin').colorscheme({enable_preview = true})<cr>", desc = "Colorscheme with Preview" },
+        {
+          "<leader>sp",
+          "<cmd>lua require('telescope.builtin').colorscheme({enable_preview = true})<cr>",
+          desc = "Colorscheme with Preview",
+        },
         -- Treesitter
         { "<leader>T", group = "Treesitter" },
-        { "<leader>Ti", "<cmd>TSConfigInfo<cr>", desc = "Info" },
+        { "<leader>Ti", "<cmd>LvimTreesitterInfo<cr>", desc = "Info" },
       },
     },
     -- Floating/split terminal. The whole subtree (minus `active`) is forwarded

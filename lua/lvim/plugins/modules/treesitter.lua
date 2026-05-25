@@ -21,12 +21,47 @@
 -- `indent.enable` — so a user's `config.lua` doesn't need to know
 -- which branch is actually on disk.
 local M = {}
+local warned_missing_cli = false
+
+local function has_tree_sitter_cli()
+  return vim.fn.executable("tree-sitter") == 1
+end
+
+local function warn_missing_tree_sitter_cli()
+  if warned_missing_cli then
+    return
+  end
+  warned_missing_cli = true
+  vim.schedule(function()
+    vim.notify("nvim-treesitter parser installation skipped: `tree-sitter` CLI not found on PATH", vim.log.levels.WARN)
+  end)
+end
+
+local function parser_requests_install(opts)
+  if type(opts.ensure_installed) == "table" then
+    return #opts.ensure_installed > 0
+  end
+  if type(opts.ensure_installed) == "string" then
+    return opts.ensure_installed ~= ""
+  end
+  return opts.auto_install == true
+end
 
 local function setup_master(opts)
   local ok, configs = pcall(require, "nvim-treesitter.configs")
   if not ok then
     return
   end
+
+  if not has_tree_sitter_cli() then
+    if parser_requests_install(opts) then
+      warn_missing_tree_sitter_cli()
+    end
+    opts = vim.deepcopy(opts)
+    opts.ensure_installed = {}
+    opts.auto_install = false
+  end
+
   configs.setup(opts)
 end
 
@@ -40,8 +75,12 @@ local function setup_main(opts)
   -- returns immediately; first-time highlighting on a not-yet-installed
   -- parser will silently no-op until the build finishes. Subsequent
   -- opens of the same filetype get full highlighting.
-  if type(opts.ensure_installed) == "table" and #opts.ensure_installed > 0 then
-    pcall(nt.install, opts.ensure_installed)
+  if parser_requests_install(opts) then
+    if has_tree_sitter_cli() then
+      pcall(nt.install, opts.ensure_installed)
+    else
+      warn_missing_tree_sitter_cli()
+    end
   end
 
   -- Per-buffer highlight start. `main` no longer registers a global
@@ -66,11 +105,7 @@ local function setup_main(opts)
     vim.api.nvim_create_autocmd("FileType", {
       group = vim.api.nvim_create_augroup("lvim_treesitter_indent", { clear = true }),
       callback = function(args)
-        vim.api.nvim_set_option_value(
-          "indentexpr",
-          "v:lua.require'nvim-treesitter'.indentexpr()",
-          { buf = args.buf }
-        )
+        vim.api.nvim_set_option_value("indentexpr", "v:lua.require'nvim-treesitter'.indentexpr()", { buf = args.buf })
       end,
     })
   end

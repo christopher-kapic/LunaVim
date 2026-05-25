@@ -32,10 +32,7 @@ local M = {}
 function M.require_safe(name)
   local ok, module = pcall(require, name)
   if not ok then
-    vim.notify(
-      string.format("lvim: failed to require '%s': %s", name, module),
-      vim.log.levels.WARN
-    )
+    vim.notify(string.format("lvim: failed to require '%s': %s", name, module), vim.log.levels.WARN)
     return nil
   end
   return module

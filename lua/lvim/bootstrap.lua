@@ -53,8 +53,7 @@ end
 
 local function resolve_dirs()
   return {
-    base = env_value("LUNAVIM_BASE_DIR", "LUNARVIM_BASE_DIR")
-      or vim.fn.fnamemodify(bootstrap_source(), ":p:h:h:h"),
+    base = env_value("LUNAVIM_BASE_DIR", "LUNARVIM_BASE_DIR") or vim.fn.fnamemodify(bootstrap_source(), ":p:h:h:h"),
     runtime = env_value("LUNAVIM_RUNTIME_DIR", "LUNARVIM_RUNTIME_DIR")
       or join_path(xdg_home("XDG_DATA_HOME", ".local/share"), "lunavim"),
     config = env_value("LUNAVIM_CONFIG_DIR", "LUNARVIM_CONFIG_DIR")
@@ -95,11 +94,7 @@ function M.check_min_nvim_version()
   local patch = current.patch or 0
   local ok = major > MIN_NVIM_VERSION.major
     or (major == MIN_NVIM_VERSION.major and minor > MIN_NVIM_VERSION.minor)
-    or (
-      major == MIN_NVIM_VERSION.major
-      and minor == MIN_NVIM_VERSION.minor
-      and patch >= MIN_NVIM_VERSION.patch
-    )
+    or (major == MIN_NVIM_VERSION.major and minor == MIN_NVIM_VERSION.minor and patch >= MIN_NVIM_VERSION.patch)
 
   if not ok then
     local message = string.format(

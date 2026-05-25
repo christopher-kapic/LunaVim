@@ -73,9 +73,13 @@ local function ref_position_zero_indexed(opts)
   local rp = opts and opts.ref_position
   if type(rp) == "table" and type(rp[1]) == "number" and type(rp[2]) == "number" then
     local row = rp[1] - 1
-    if row < 0 then row = 0 end
+    if row < 0 then
+      row = 0
+    end
     local col = rp[2] - 1
-    if col < 0 then col = 0 end
+    if col < 0 then
+      col = 0
+    end
     return row, col
   end
   local ok, cursor = pcall(vim.api.nvim_win_get_cursor, 0)
@@ -83,9 +87,13 @@ local function ref_position_zero_indexed(opts)
     return nil
   end
   local row = cursor[1] - 1
-  if row < 0 then row = 0 end
+  if row < 0 then
+    row = 0
+  end
   local col = cursor[2]
-  if col < 0 then col = 0 end
+  if col < 0 then
+    col = 0
+  end
   return row, col
 end
 
