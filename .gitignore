@@ -1,0 +1,11 @@
+*.swp
+*.swo
+.luarc.json
+lazy-lock.json
+!tests/fixtures/lazy-lock.json
+tags
+tmp/
+.cache/
+tests/deps/
+.claude/scheduled_tasks.lock
+.claude/settings.local.json

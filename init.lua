@@ -1,0 +1,1 @@
+local root = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h"); package.path = root .. "/lua/?.lua;" .. root .. "/lua/?/init.lua;" .. package.path; vim.opt.rtp:prepend(root); require('lvim').start()

@@ -1,0 +1,114 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# Least-privilege: CI only reads the repo; no token write scopes needed.
+permissions:
+  contents: read
+
+# Cancel any in-flight runs for the same PR / branch when a new commit lands.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    name: test (nvim ${{ matrix.neovim }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        neovim: ["v0.11.0", "stable"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Neovim ${{ matrix.neovim }}
+        uses: rhysd/action-setup-vim@v1
+        with:
+          neovim: true
+          version: ${{ matrix.neovim }}
+
+      - name: Print Neovim version
+        run: nvim --version
+
+      - name: Install ripgrep and fd
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ripgrep fd-find
+          sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
+
+      - name: Run tests
+        run: make test
+
+      - name: Run smoke test
+        run: bash scripts/lvim-smoke.sh
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      STYLUA_VERSION: "2.0.2"
+      SELENE_VERSION: "0.27.1"
+    steps:
+      - uses: actions/checkout@v4
+
+      # Install stylua/selene into a user-writable directory so actions/cache
+      # can restore them on subsequent runs without sudo. /usr/local/bin is
+      # root-owned on GitHub-hosted Ubuntu runners and the cache action runs
+      # unprivileged, so tar-extracting cached binaries there fails.
+      - name: Add ~/.local/bin to PATH
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install shellcheck
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+
+      - name: Cache stylua binary
+        id: cache-stylua
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin/stylua
+          key: stylua-${{ runner.os }}-${{ env.STYLUA_VERSION }}
+
+      - name: Install stylua
+        if: steps.cache-stylua.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o /tmp/stylua.zip \
+            "https://github.com/JohnnyMorganz/StyLua/releases/download/v${STYLUA_VERSION}/stylua-linux-x86_64.zip"
+          unzip -o /tmp/stylua.zip -d /tmp/stylua
+          install -m 0755 /tmp/stylua/stylua "$HOME/.local/bin/stylua"
+
+      - name: Cache selene binary
+        id: cache-selene
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin/selene
+          key: selene-${{ runner.os }}-${{ env.SELENE_VERSION }}
+
+      - name: Install selene
+        if: steps.cache-selene.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o /tmp/selene.zip \
+            "https://github.com/Kampfkarren/selene/releases/download/${SELENE_VERSION}/selene-light-${SELENE_VERSION}-linux.zip"
+          unzip -o /tmp/selene.zip -d /tmp/selene
+          install -m 0755 /tmp/selene/selene "$HOME/.local/bin/selene"
+
+      - name: Run lint
+        run: make lint

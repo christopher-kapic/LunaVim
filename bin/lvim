@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="0.1.0-alpha"
+
+export NVIM_APPNAME="lvim"
+
+BIN_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+LVIM_BASE_DIR="$(cd -- "$BIN_DIR/.." && pwd -P)"
+LVIM_INIT_FILE="$LVIM_BASE_DIR/init.lua"
+
+case "${1:-}" in
+  --version)
+    printf 'lvim %s\n' "$VERSION"
+    exit 0
+    ;;
+  doctor)
+    exec nvim --headless -u "$LVIM_INIT_FILE" \
+      -c "luafile $LVIM_BASE_DIR/scripts/doctor.lua" \
+      -c "qall!"
+    ;;
+esac
+
+xdg_home() {
+  local name="$1"
+  local fallback="$2"
+  local value="${!name:-}"
+
+  if [[ -n "$value" ]]; then
+    printf '%s\n' "$value"
+  else
+    printf '%s/%s\n' "$HOME" "$fallback"
+  fi
+}
+
+LVIM_RUNTIME_DIR="$(xdg_home XDG_DATA_HOME .local/share)/lunavim"
+LVIM_CONFIG_DIR="$(xdg_home XDG_CONFIG_HOME .config)/lvim"
+LVIM_CACHE_DIR="$(xdg_home XDG_CACHE_HOME .cache)/lvim"
+
+export LUNAVIM_BASE_DIR="${LUNAVIM_BASE_DIR:-${LUNARVIM_BASE_DIR:-$LVIM_BASE_DIR}}"
+export LUNAVIM_RUNTIME_DIR="${LUNAVIM_RUNTIME_DIR:-${LUNARVIM_RUNTIME_DIR:-$LVIM_RUNTIME_DIR}}"
+export LUNAVIM_CONFIG_DIR="${LUNAVIM_CONFIG_DIR:-${LUNARVIM_CONFIG_DIR:-$LVIM_CONFIG_DIR}}"
+export LUNAVIM_CACHE_DIR="${LUNAVIM_CACHE_DIR:-${LUNARVIM_CACHE_DIR:-$LVIM_CACHE_DIR}}"
+
+export LUNARVIM_BASE_DIR="${LUNARVIM_BASE_DIR:-$LUNAVIM_BASE_DIR}"
+export LUNARVIM_RUNTIME_DIR="${LUNARVIM_RUNTIME_DIR:-$LUNAVIM_RUNTIME_DIR}"
+export LUNARVIM_CONFIG_DIR="${LUNARVIM_CONFIG_DIR:-$LUNAVIM_CONFIG_DIR}"
+export LUNARVIM_CACHE_DIR="${LUNARVIM_CACHE_DIR:-$LUNAVIM_CACHE_DIR}"
+
+exec nvim -u "$LVIM_INIT_FILE" "$@"
