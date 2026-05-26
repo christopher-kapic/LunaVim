@@ -107,6 +107,13 @@ function M.setup()
   map("n", "<leader>gp", "<cmd>Gitsigns preview_hunk<CR>", "Preview hunk")
   map("n", "<leader>gb", "<cmd>Gitsigns blame_line<CR>", "Blame line")
 
+  -- Toggleterm's `open_mapping = [[<c-\>]]` only registers `<c-\>` in normal
+  -- and terminal modes. Mirror it into insert mode so pressing `<c-\>` while
+  -- typing also opens the terminal; routing through `<cmd>ToggleTerm<CR>`
+  -- exits insert mode cleanly and trips lazy.nvim's `cmd = "ToggleTerm"`
+  -- trigger to load toggleterm on first press.
+  map("i", [[<C-\>]], "<cmd>ToggleTerm<CR>", "Toggle terminal")
+
   -- Lazygit float on `<leader>gg`, only registered when lazygit is on $PATH so
   -- users without it do not see a phantom mapping. The rhs requires the
   -- terminal module, whose `toggle_lazygit` requires `toggleterm.terminal`;
