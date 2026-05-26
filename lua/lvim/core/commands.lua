@@ -374,22 +374,29 @@ end
 -- user staring at a bare `[No Name]` and confused about where the
 -- explorer went. Three-state smart toggle instead:
 --
---   1. Full-screen tree (the tree IS the only window) → split vertically
---      to add a narrow sidebar tree on the right. Both windows show the
---      same tree buffer (nvim-tree is single-instance, so a `vsplit`
---      clones the buffer reference). Result: `tree | tree` with the
---      right window resized to nvim-tree's configured sidebar width
---      and focus kept on the new sidebar on the right. Open a file from either
---      window and that window's buffer is replaced with the file,
---      leaving the other as a side panel.
---   2. Multiple tree windows (the split state from case 1) → close the
---      non-focused tree windows. We can't call `:NvimTreeToggle` here:
---      after our manual `vsplit`, nvim-tree's internal "is-open"
---      tracking gets out of sync with the actual window count, and the
---      next toggle hits `E95: Buffer with this name already exists`
---      because it tries to recreate `NvimTree_1` while a sibling
---      window still references it. Closing windows directly with
---      `nvim_win_close` sidesteps that path entirely.
+--   1. Full-screen tree (the tree IS the only window) → carve off an
+--      empty editor window on the OPPOSITE side from the configured
+--      tree position, leaving the tree itself as a sidebar at its
+--      configured width and focusing the new empty editor. Only ONE
+--      window ever shows the NvimTree buffer. (Earlier iterations used
+--      `rightbelow vsplit` to CLONE the tree buffer into a second
+--      window, but that left two windows pointing at the same
+--      NvimTree_1 buffer — and nvim-tree only tracks one of them as
+--      "the tree". Cursor-reading APIs like `get_node_under_cursor`
+--      use `view.get_winnr()` to look up the cursor row, so keypresses
+--      in the duplicate window operated on the cursor position of the
+--      ORIGINAL tracked tree window — a confusing mismatch the user
+--      saw as "my interactions go to the main window." Splitting an
+--      empty buffer off instead keeps nvim-tree's internal state in
+--      sync with what's actually on screen.)
+--   2. Multiple tree windows (legacy state, or if a user manually
+--      `:vsplit`s from the tree) → close the non-focused tree
+--      windows. We can't call `:NvimTreeToggle` here: nvim-tree's
+--      internal "is-open" tracking gets out of sync with the actual
+--      window count, and the next toggle hits `E95: Buffer with this
+--      name already exists` because it tries to recreate `NvimTree_1`
+--      while a sibling window still references it. Closing windows
+--      directly with `nvim_win_close` sidesteps that path entirely.
 --   3. One tree window + other editor windows, or no tree at all →
 --      `:NvimTreeToggle`. nvim-tree's internal state is consistent
 --      here, so the close/open path works without buffer conflicts.
@@ -406,9 +413,49 @@ local function lvim_explorer()
 
   if #tree_wins == 1 and total_wins == 1 then
     local builtin = (_G.lvim and _G.lvim.builtin and _G.lvim.builtin.nvimtree) or {}
-    local sidebar_width = ((builtin.setup or {}).view or {}).width or 30
-    vim.cmd("rightbelow vsplit")
-    vim.cmd("vertical resize " .. tostring(sidebar_width))
+    local view_opts = (builtin.setup or {}).view or {}
+    local sidebar_width = view_opts.width or 30
+    local tree_side = view_opts.side or "left"
+
+    -- Open a fresh empty buffer in a new window pinned to the side
+    -- opposite the tree. `:topleft vnew` / `:botright vnew` ignore
+    -- `splitright`/`splitbelow` (they're positional modifiers, not
+    -- relative ones) so the resulting layout is unambiguous regardless
+    -- of the user's split-direction options.
+    if tree_side == "right" then
+      vim.cmd("topleft vnew")
+    else
+      vim.cmd("botright vnew")
+    end
+
+    -- Mark the staging buffer unlisted + wipe-on-hidden so it does not
+    -- pollute the bufferline tabs and disappears the moment the user
+    -- opens a real file from the tree (which replaces it in this
+    -- window). Without `bufhidden = wipe`, the unnamed buffer lingers
+    -- in the buffer list until `:bd` is run.
+    local staging = vim.api.nvim_get_current_buf()
+    vim.bo[staging].buflisted = false
+    vim.bo[staging].bufhidden = "wipe"
+
+    -- Pin the tree back to its configured sidebar width. The new
+    -- editor window above took the remainder, but on a wide terminal
+    -- the tree window's residual width is whatever Neovim defaulted
+    -- the split to — explicitly resizing keeps the sidebar consistent
+    -- with the dedicated `:NvimTreeToggle` path.
+    --
+    -- We also return focus to the tree window: the user just summoned
+    -- the explorer and expects to navigate it, not to type into the
+    -- empty `[No Name]` buffer that vnew created. The empty buffer is
+    -- staged so a later file-open from the tree has a real editor
+    -- window to land in — once nvim-tree's window picker writes the
+    -- file into that window, focus follows the file naturally.
+    local tree_win = tree_wins[1]
+    if vim.api.nvim_win_is_valid(tree_win) then
+      vim.api.nvim_win_call(tree_win, function()
+        vim.cmd("vertical resize " .. tostring(sidebar_width))
+      end)
+      vim.api.nvim_set_current_win(tree_win)
+    end
     return
   end
 
