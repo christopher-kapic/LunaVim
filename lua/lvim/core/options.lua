@@ -40,7 +40,7 @@ function M.setup()
     fileencoding = "utf-8",
     -- UI
     number = true,
-    relativenumber = true,
+    relativenumber = false,
     numberwidth = 4,
     signcolumn = "yes",
     cursorline = true,
