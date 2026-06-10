@@ -38,6 +38,11 @@ local JSX_FILETYPES = {
   javascriptreact = true,
 }
 
+local DOTENV_COMMENTSTRING = "# %s"
+local DOTENV_FILETYPES = {
+  dotenv = true,
+}
+
 -- Treesitter node types that indicate a JSX/TSX expression context. Walking
 -- up from the cursor node and checking against this set lets us detect JSX
 -- even when the cursor is on a leaf (e.g. a string or identifier) inside the
@@ -61,6 +66,41 @@ local function is_jsx_node(node)
     node = node:parent()
   end
   return false
+end
+
+local function is_dotenv_buffer(bufnr)
+  local ft = vim.bo[bufnr].filetype
+  if DOTENV_FILETYPES[ft] then
+    return true
+  end
+
+  local name = vim.api.nvim_buf_get_name(bufnr)
+  if name == "" then
+    return false
+  end
+  local basename = vim.fn.fnamemodify(name, ":t")
+  return basename == ".env"
+    or basename:match("^%.env%.") ~= nil
+    or basename:match("%.env$") ~= nil
+    or basename:match("%.env%.") ~= nil
+end
+
+local function apply_dotenv_commentstring(args)
+  local bufnr = (args and args.buf) or vim.api.nvim_get_current_buf()
+  if vim.api.nvim_buf_is_valid(bufnr) and is_dotenv_buffer(bufnr) then
+    vim.bo[bufnr].commentstring = DOTENV_COMMENTSTRING
+  end
+end
+
+local function setup_dotenv_commentstring()
+  local group = vim.api.nvim_create_augroup("lvim_dotenv_commentstring", { clear = true })
+  vim.api.nvim_create_autocmd({ "BufReadPost", "BufNewFile", "FileType" }, {
+    group = group,
+    pattern = { ".env", ".env.*", "*.env", "*.env.*", "dotenv" },
+    desc = "Use shell-style comments in dotenv files",
+    callback = apply_dotenv_commentstring,
+  })
+  apply_dotenv_commentstring()
 end
 
 -- Resolve the action's reference position. mini.comment passes
@@ -138,6 +178,8 @@ function M.setup(_)
   if not ok then
     return
   end
+
+  setup_dotenv_commentstring()
 
   mini_comment.setup({
     options = options,
