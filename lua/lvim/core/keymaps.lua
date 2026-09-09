@@ -123,6 +123,77 @@ function M.setup()
     map("n", "<leader>gg", "<cmd>lua require('lvim.plugins.modules.terminal').toggle_lazygit()<CR>", "Lazygit")
   end
 
+  -- Split resize on <C-arrow>. Restored from the upstream LunarVim default
+  -- set; without these the only way to resize a split is `<C-w>` arithmetic.
+  map("n", "<C-Up>", "<cmd>resize -2<CR>", "Shrink split height")
+  map("n", "<C-Down>", "<cmd>resize +2<CR>", "Grow split height")
+  map("n", "<C-Left>", "<cmd>vertical resize -2<CR>", "Shrink split width")
+  map("n", "<C-Right>", "<cmd>vertical resize +2<CR>", "Grow split width")
+
+  -- macOS terminals commonly intercept <C-arrow> for Mission Control / Spaces,
+  -- so the upstream reference mirrors the resize family onto <A-arrow> there.
+  -- Mirroring (rather than moving) keeps <C-arrow> working on the macOS
+  -- terminals that do pass it through.
+  if vim.fn.has("mac") == 1 then
+    map("n", "<A-Up>", "<cmd>resize -2<CR>", "Shrink split height")
+    map("n", "<A-Down>", "<cmd>resize +2<CR>", "Grow split height")
+    map("n", "<A-Left>", "<cmd>vertical resize -2<CR>", "Shrink split width")
+    map("n", "<A-Right>", "<cmd>vertical resize +2<CR>", "Grow split width")
+  end
+
+  -- VSCode-style line move on <A-j>/<A-k>, in normal, insert and visual-block
+  -- mode. The `x`-mode `J`/`K` maps above cover the same intent for a charwise
+  -- selection; these are the upstream LunarVim bindings and are what a
+  -- migrating user's fingers expect.
+  map("n", "<A-j>", "<cmd>m .+1<CR>==", "Move line down")
+  map("n", "<A-k>", "<cmd>m .-2<CR>==", "Move line up")
+  map("i", "<A-j>", "<Esc><cmd>m .+1<CR>==gi", "Move line down")
+  map("i", "<A-k>", "<Esc><cmd>m .-2<CR>==gi", "Move line up")
+  map("x", "<A-j>", ":m '>+1<CR>gv=gv", "Move selection down")
+  map("x", "<A-k>", ":m '<-2<CR>gv=gv", "Move selection up")
+
+  -- Window navigation from insert mode, matching the upstream reference. The
+  -- `<C-\><C-N>` prefix leaves insert mode before the window command so the
+  -- cursor lands in the target window in normal mode.
+  map("i", "<A-Up>", [[<C-\><C-N><C-w>k]], "Window up")
+  map("i", "<A-Down>", [[<C-\><C-N><C-w>j]], "Window down")
+  map("i", "<A-Left>", [[<C-\><C-N><C-w>h]], "Window left")
+  map("i", "<A-Right>", [[<C-\><C-N><C-w>l]], "Window right")
+
+  -- Terminal-mode window navigation. Without these, <C-h/j/k/l> inside a
+  -- toggleterm buffer is swallowed by the shell and there is no way out of the
+  -- terminal window except <C-\><C-n> followed by a window command.
+  map("t", "<C-h>", [[<C-\><C-N><C-w>h]], "Window left")
+  map("t", "<C-j>", [[<C-\><C-N><C-w>j]], "Window down")
+  map("t", "<C-k>", [[<C-\><C-N><C-w>k]], "Window up")
+  map("t", "<C-l>", [[<C-\><C-N><C-w>l]], "Window right")
+
+  -- Quickfix navigation and toggle. The upstream reference binds <C-q> to a
+  -- vimscript `QuickFixToggle()` defined via `vim.cmd[[...]]`; we implement the
+  -- same behavior as a Lua callback instead, so no global vimscript function
+  -- is introduced into the user's session.
+  map("n", "]q", "<cmd>cnext<CR>", "Next quickfix item")
+  map("n", "[q", "<cmd>cprev<CR>", "Previous quickfix item")
+  map("n", "<C-q>", function()
+    for _, win in ipairs(vim.fn.getwininfo()) do
+      if win.quickfix == 1 then
+        vim.cmd("cclose")
+        return
+      end
+    end
+    vim.cmd("copen")
+  end, "Toggle quickfix list")
+
+  -- Command-mode completion-menu navigation. `expr = true` is required so the
+  -- rhs is evaluated at press time and can branch on `pumvisible()`; when the
+  -- wildmenu is not showing, the keys fall through to their literal meaning.
+  vim.keymap.set("c", "<C-j>", function()
+    return vim.fn.pumvisible() == 1 and "<C-n>" or "<C-j>"
+  end, { noremap = true, expr = true, desc = "Next completion item" })
+  vim.keymap.set("c", "<C-k>", function()
+    return vim.fn.pumvisible() == 1 and "<C-p>" or "<C-k>"
+  end, { noremap = true, expr = true, desc = "Previous completion item" })
+
   local user_keys = (_G.lvim and _G.lvim.keys) or {}
   for mode_name, mappings in pairs(user_keys) do
     local mode = mode_adapters[mode_name] or mode_name

@@ -46,6 +46,27 @@ jobs:
           sudo apt-get install -y --no-install-recommends ripgrep fd-find
           sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
 
+      # The tree-sitter CLI is a hard requirement, not a nicety: README lists
+      # it under Requirements, `lvim/health.lua` checks for it, and
+      # `scripts/integration-smoke.sh` (invoked at the end of the smoke run)
+      # exits 1 without it. Several smoke assertions also branch on its
+      # presence, because the treesitter module deliberately neutralises
+      # parser installation when it is absent — so without the CLI the smoke
+      # run exercises only the degraded path.
+      #
+      # Installed from the upstream release binary rather than npm: the npm
+      # `tree-sitter-cli` package is deprecated, which README also calls out.
+      - name: Install tree-sitter CLI
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/tree-sitter/tree-sitter/releases/download/${TREE_SITTER_VERSION}/tree-sitter-linux-x64.gz" \
+            | gunzip > tree-sitter
+          chmod +x tree-sitter
+          sudo mv tree-sitter /usr/local/bin/tree-sitter
+          tree-sitter --version
+        env:
+          TREE_SITTER_VERSION: v0.27.0
+
       - name: Run tests
         run: make test
 

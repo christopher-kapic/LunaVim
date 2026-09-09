@@ -36,40 +36,105 @@ local function mapping_enabled(entry)
     return true
   end
 
-  if rhs:find("require'dapui'") or rhs:find('require%("dapui"%)') then
+  -- Match the spellings Lua accepts for requiring a module, since these rhs
+  -- strings are user-editable: require'dap', require "dap", require('dap'),
+  -- require([[dap]]), require([=[dap]=]).
+  --
+  -- `%f[%w_]` is Lua's frontier pattern, matching the transition into a word
+  -- character. It is what stops `myrequire('dap')` from counting as a require
+  -- of dap. The closing quote/bracket right after the name is what stops
+  -- `dapui` from matching a search for `dap`.
+  --
+  -- This is a heuristic over strings, not a parser: a binding that merely
+  -- prints the text `require('dap')` would also be treated as needing dap.
+  -- That trade is deliberate -- the cost is one hidden mapping in an
+  -- unrealistic case, versus a popup row that errors on press in a realistic
+  -- one.
+  local function requires_module(name)
+    local patterns = {
+      "%f[%w_]require%s*%(%s*['\"]" .. name .. "['\"]",
+      "%f[%w_]require%s*['\"]" .. name .. "['\"]",
+      "%f[%w_]require%s*%(?%s*%[=*%[" .. name .. "%]=*%]",
+    }
+    for _, pattern in ipairs(patterns) do
+      if rhs:find(pattern) then
+        return true
+      end
+    end
+    return false
+  end
+
+  if requires_module("dapui") then
     return has_module("dapui")
   end
 
-  if rhs:find("require'dap'") or rhs:find('require%("dap"%)') then
+  if requires_module("dap") then
     return has_module("dap")
   end
 
   return true
 end
 
-local function group_lhs(lhs)
-  return lhs:match("^(<leader>[%w%p])")
+-- Every prefix of `lhs` that could name a group, longest first.
+--
+-- `<leader>dar` belongs to both `<leader>da` and `<leader>d`, so a filtered
+-- child has to mark BOTH as having had children. Matching only the single
+-- character after `<leader>` attributed `<leader>dar` to `<leader>d` alone,
+-- which left a nested `<leader>da` group standing after every one of its
+-- bindings was filtered away — a which-key row that opens onto nothing.
+local function group_prefixes(lhs)
+  local body = lhs:match("^<leader>(.+)$")
+  if not body then
+    return {}
+  end
+  local out = {}
+  -- Stop one short of the full LHS: a binding is not its own group.
+  for i = 1, #body - 1 do
+    out[#out + 1] = "<leader>" .. body:sub(1, i)
+  end
+  return out
 end
 
+-- Drop bindings whose backing plugin is absent, and drop a group label only
+-- when every binding that lived under it was dropped.
+--
+-- The case this exists for: the `<leader>d` Debug group's entries all call
+-- `require('dap')`. With nvim-dap not installed they are filtered out, and
+-- leaving the group label behind would put a Debug row in the which-key popup
+-- that opens onto nothing.
+--
+-- A group with NO child bindings at all is kept. It is not an emptied group,
+-- it is a user's deliberate label -- `table.insert(lvim.builtin.whichkey.mappings,
+-- { "<leader>x", group = "Extra" })` is the documented way to declare a prefix
+-- before binding anything under it, and an earlier version of this function
+-- discarded exactly that, silently losing user config. `had_children` is what
+-- separates "emptied by filtering" from "never had any".
 local function filter_mappings(mappings)
-  local filtered = {}
+  local kept = {}
+  local had_children = {}
   local enabled_groups = {}
 
   for _, entry in ipairs(mappings) do
     if entry.group ~= nil then
-      filtered[#filtered + 1] = entry
-    elseif mapping_enabled(entry) then
-      filtered[#filtered + 1] = entry
-      local lhs = group_lhs(entry[1])
-      if lhs then
-        enabled_groups[lhs] = true
+      kept[#kept + 1] = entry
+    else
+      local prefixes = group_prefixes(entry[1])
+      for _, prefix in ipairs(prefixes) do
+        had_children[prefix] = true
+      end
+      if mapping_enabled(entry) then
+        kept[#kept + 1] = entry
+        for _, prefix in ipairs(prefixes) do
+          enabled_groups[prefix] = true
+        end
       end
     end
   end
 
   local result = {}
-  for _, entry in ipairs(filtered) do
-    if entry.group == nil or enabled_groups[entry[1]] then
+  for _, entry in ipairs(kept) do
+    local emptied = entry.group ~= nil and had_children[entry[1]] and not enabled_groups[entry[1]]
+    if not emptied then
       result[#result + 1] = entry
     end
   end

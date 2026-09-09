@@ -9,7 +9,8 @@ usage() {
   cat <<'USAGE'
 Usage: snapshot-export.sh [-h|--help]
 
-Copy the current user's <config>/lazy-lock.json onto snapshots/default.json.
+Copy the current user's <config>/lazy-lock.json onto snapshots/default.json,
+filtered down to the plugins in LunaVim's own core spec.
 
 Environment:
   LUNAVIM_CONFIG_DIR  Source config dir (default: ~/.config/lvim)
@@ -45,6 +46,84 @@ if [[ ! -f "$SRC" ]]; then
   exit 1
 fi
 
+# Filter the lock down to the core plugin spec before writing.
+#
+# `lazy-lock.json` records EVERY plugin lazy.nvim manages for the exporting
+# maintainer, including anything they added through `lvim.plugins` in their own
+# config.lua. Copying it verbatim is how `git-blame.nvim` and `mini.map` — two
+# plugins in no LunaVim spec — ended up pinned in `snapshots/default.json` and
+# shipped to every user of `:LvimSyncCorePlugins`.
+#
+# The allow-list is derived from `lua/lvim/plugins/spec.lua` at export time
+# (rather than hardcoded here) so it cannot drift from the spec. We ask a
+# headless Neovim for the key each entry occupies in the lock file, which is
+# lazy.nvim's `plugin.name`: the explicit `name = "..."` when the spec sets one,
+# otherwise the repo basename.
+#
+# nvim-treesitter is excluded on purpose. `spec.lua` selects its branch by
+# Neovim version (`master` on 0.11, `main` on 0.12+), so a single pinned commit
+# is wrong for one of the two supported versions — pinning a `main` commit and
+# then restoring it onto a `master` checkout is exactly the failure this
+# exclusion prevents. Parser and plugin updates flow through `:TSUpdate` and the
+# spec's own branch selection instead.
+ALLOW="$(
+  nvim --headless -u NONE \
+    --cmd "set rtp+=$REPO_ROOT" \
+    -c 'lua
+      local ok, spec = pcall(require, "lvim.plugins.spec")
+      if not ok then
+        vim.cmd("cquit 1")
+      end
+      local out = {}
+      for _, entry in ipairs(spec) do
+        local name = entry.name
+        if not name then
+          name = tostring(entry[1]):match("[^/]+$")
+        end
+        if name and name ~= "treesitter" then
+          out[#out + 1] = name
+        end
+      end
+      io.stdout:write(table.concat(out, "\n"))
+    ' \
+    -c q 2>/dev/null
+)"
+
+if [[ -z "$ALLOW" ]]; then
+  printf 'error: could not derive the core plugin list from %s/lua/lvim/plugins/spec.lua\n' "$REPO_ROOT" >&2
+  exit 1
+fi
+
 mkdir -p "$(dirname "$DST")"
-cp "$SRC" "$DST"
+
+ALLOW="$ALLOW" python3 - "$SRC" "$DST" <<'PYFILTER'
+import json, os, sys
+
+src, dst = sys.argv[1], sys.argv[2]
+allow = {n for n in os.environ["ALLOW"].split("\n") if n}
+
+with open(src) as fh:
+    lock = json.load(fh)
+
+kept = {k: v for k, v in lock.items() if k in allow}
+dropped = sorted(set(lock) - set(kept))
+missing = sorted(allow - set(kept))
+
+with open(dst, "w") as fh:
+    fh.write("{\n")
+    items = sorted(kept.items())
+    for i, (k, v) in enumerate(items):
+        tail = "" if i == len(items) - 1 else ","
+        fh.write('  %s: { "branch": %s, "commit": %s }%s\n'
+                 % (json.dumps(k), json.dumps(v.get("branch")), json.dumps(v.get("commit")), tail))
+    fh.write("}\n")
+
+print("kept %d core entries" % len(kept))
+if dropped:
+    print("dropped %d non-core entries: %s" % (len(dropped), ", ".join(dropped)))
+if missing:
+    print("WARNING: %d core plugins absent from the lock (not installed?): %s"
+          % (len(missing), ", ".join(missing)))
+PYFILTER
+
 printf 'wrote %s from %s\n' "$DST" "$SRC"

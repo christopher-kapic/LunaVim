@@ -9,3 +9,4 @@ tmp/
 tests/deps/
 .claude/scheduled_tasks.lock
 .claude/settings.local.json
+references/

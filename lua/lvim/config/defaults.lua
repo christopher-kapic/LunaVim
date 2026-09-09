@@ -437,6 +437,38 @@ return {
     -- by the module and is not exposed for user override here; Phase 6 may
     -- extend the surface if needed.
     comment = { active = true, options = {} },
+    -- Completion, via Saghen/blink.cmp. The whole subtree (minus `active`) is
+    -- forwarded to `require("blink.cmp").setup(opts)` by
+    -- `lvim/plugins/modules/cmp.lua`.
+    --
+    -- `keymap.preset = "default"` is blink's Neovim-native mapping set:
+    -- `<C-space>` opens the menu, `<C-n>`/`<C-p>` move, `<C-y>` accepts and
+    -- `<C-e>` cancels. This is deliberately not the `super-tab` preset --
+    -- `<Tab>` is load-bearing for indentation, and LunarVim's nvim-cmp
+    -- defaults did not bind plain `<Tab>` to accept either. A user who wants
+    -- it can set `lvim.builtin.cmp.keymap.preset = "super-tab"`.
+    --
+    -- `sources.default` lists the four providers blink ships in-tree, which is
+    -- the set nvim-cmp needed cmp-nvim-lsp, cmp-buffer, cmp-path and
+    -- cmp_luasnip to cover. `lsp` is first so server completions outrank
+    -- buffer words for the same prefix.
+    --
+    -- `signature.enabled` turns on the signature-help window while typing
+    -- arguments; blink marks the feature experimental but it is the direct
+    -- replacement for the `gs` binding's manual invocation and is stable in
+    -- practice for the servers LunaVim installs by default.
+    cmp = {
+      active = true,
+      keymap = { preset = "default" },
+      sources = {
+        default = { "lsp", "path", "snippets", "buffer" },
+      },
+      completion = {
+        documentation = { auto_show = true, auto_show_delay_ms = 200 },
+        ghost_text = { enabled = false },
+      },
+      signature = { enabled = true },
+    },
     dap = { active = true },
     -- Dashboard. The whole subtree (minus `active`) is consumed by
     -- `lvim/plugins/modules/alpha.lua`. `mode` selects an `alpha.themes.*`
@@ -623,6 +655,44 @@ return {
     capabilities = nil,
     automatic_servers_installation = false,
     diagnostic = {},
+    -- Buffer-local LSP mappings, applied by `lvim/lsp/handlers.lua`
+    -- `make_on_attach()` to every buffer a server attaches to. Mirrors the
+    -- LunarVim contract (`lvim.lsp.buffer_mappings.<mode>`) so a user can
+    -- retarget a single key without having to replace the whole `on_attach`:
+    --
+    --   lvim.lsp.buffer_mappings.normal_mode["gd"] =
+    --     { "<cmd>Telescope lsp_definitions<cr>", "Goto definition" }
+    --   lvim.lsp.buffer_mappings.normal_mode["gs"] = false  -- drop the default
+    --
+    -- Each entry is `{ rhs, desc }`; `false` removes the mapping. Values are
+    -- kept as `<cmd>...<cr>` strings rather than function references so the
+    -- table stays pure data, matching the convention already used by
+    -- `builtin.telescope.defaults.mappings` and `builtin.whichkey.mappings`
+    -- (a plain-data table survives `vim.deepcopy` in `config.load_defaults()`
+    -- and can be serialised for `:LvimInfo` without special-casing).
+    buffer_mappings = {
+      normal_mode = {
+        ["K"] = { "<cmd>lua vim.lsp.buf.hover()<cr>", "Show hover" },
+        ["gd"] = { "<cmd>lua vim.lsp.buf.definition()<cr>", "Goto definition" },
+        ["gD"] = { "<cmd>lua vim.lsp.buf.declaration()<cr>", "Goto declaration" },
+        ["gr"] = { "<cmd>lua vim.lsp.buf.references()<cr>", "Goto references" },
+        ["gI"] = { "<cmd>lua vim.lsp.buf.implementation()<cr>", "Goto implementation" },
+        ["gs"] = { "<cmd>lua vim.lsp.buf.signature_help()<cr>", "Show signature help" },
+        ["gl"] = { "<cmd>lua vim.diagnostic.open_float({ scope = 'line' })<cr>", "Show line diagnostics" },
+        -- `<leader>la` / `<leader>lr` are also registered globally by the
+        -- which-key spec above. Keeping buffer-local copies here is
+        -- deliberate redundancy: a user who sets
+        -- `lvim.builtin.whichkey.active = false` still gets code-action and
+        -- rename on the keys their fingers know, and both bindings stay
+        -- overridable through this table. Same rhs either way, and
+        -- `on_attach` runs after which-key's `add()`, so the buffer-local
+        -- map simply shadows the identical global one.
+        ["<leader>la"] = { "<cmd>lua vim.lsp.buf.code_action()<cr>", "Code action" },
+        ["<leader>lr"] = { "<cmd>lua vim.lsp.buf.rename()<cr>", "Rename" },
+      },
+      insert_mode = {},
+      visual_mode = {},
+    },
   },
   lazy = {
     opts = {},

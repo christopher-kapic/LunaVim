@@ -288,13 +288,40 @@ step("(e) :Gitsigns toggle_signs does not error", function()
   -- actually attached before toggling. Without the attach check, a silent
   -- failure to attach (e.g. lazy-load misfire) would leave the toggle as a
   -- no-op and the test would still pass — defeating the point.
+  --
+  -- The wait is 15s, not 2s. gitsigns attaches asynchronously: it shells out to
+  -- `git` to resolve the repo root and the file's index entry before it
+  -- populates `b:gitsigns_status_dict`, and in this harness that runs against a
+  -- freshly `git init`-ed tree on a machine that is simultaneously finishing a
+  -- plugin install and a treesitter parser build. 2s was measured to be
+  -- unreliable -- it failed on 3 of 3 runs at f5ccbfa on a developer machine,
+  -- with no code change involved -- so it was testing machine load as much as
+  -- the attach. A generous ceiling costs nothing on a fast run (the poll exits
+  -- as soon as the value appears) and removes a flake that would otherwise
+  -- train people to re-run CI until it passes.
+  -- Wipe the buffer before re-editing so the file is genuinely READ again.
+  --
+  -- gitsigns' only lazy trigger is `event = "BufReadPre"`. Earlier steps
+  -- already loaded sample.lua, and `:edit` on an loaded, unmodified buffer does
+  -- not re-read it -- so BufReadPre never fires a second time. Whether gitsigns
+  -- was live therefore depended on whether some earlier step happened to
+  -- trigger its load first, which is why this step failed intermittently (3 of
+  -- 3 runs at f5ccbfa, 1 of 4 after) with no code change involved. Wiping
+  -- forces a real read, which fires BufReadPre, which loads gitsigns and lets
+  -- it attach. That is also the honest thing to test: a user opening a file in
+  -- a git repo.
+  local prior = vim.fn.bufnr(WORK_DIR .. "/sample.lua")
+  if prior ~= -1 then
+    pcall(vim.cmd, "bwipeout! " .. prior)
+  end
   vim.cmd("edit " .. WORK_DIR .. "/sample.lua")
   local bufnr = vim.api.nvim_get_current_buf()
-  local attached = vim.wait(2000, function()
+  local ATTACH_TIMEOUT_MS = 15000
+  local attached = vim.wait(ATTACH_TIMEOUT_MS, function()
     return vim.b[bufnr].gitsigns_status_dict ~= nil
   end, 50)
   if not attached then
-    error("gitsigns did not attach to sample.lua within 2s")
+    error(("gitsigns did not attach to sample.lua within %dms"):format(ATTACH_TIMEOUT_MS))
   end
 
   -- Drive the toggle and observe the side-effect: `:Gitsigns toggle_signs`

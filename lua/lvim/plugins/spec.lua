@@ -396,6 +396,79 @@ return {
     config = setup("conform"),
   },
 
+  -- Completion engine.
+  --
+  -- blink.cmp rather than nvim-cmp: it ships its own buffer/path/snippet/LSP
+  -- sources in-tree (nvim-cmp needs four extra repos plus LuaSnip and
+  -- friendly-snippets to reach the same place), and `lvim/lsp/handlers.lua`
+  -- `make_capabilities()` already folds `blink.get_lsp_capabilities()` into
+  -- the client capabilities it hands every server.
+  --
+  -- `version = "*"` tracks blink's tagged releases, which ship prebuilt
+  -- fuzzy-matcher binaries. Without a tag, lazy.nvim checks out the default
+  -- branch, whose Rust matcher must be built with `cargo` at install time --
+  -- an extra toolchain requirement LunaVim does not otherwise impose (see
+  -- `lvim/health.lua`, which checks for a C compiler but not Rust).
+  --
+  -- The events are the *latest* points at which blink must be live: completion
+  -- cannot be needed before the user reaches insert or cmdline mode.
+  --
+  -- They are not, in practice, what determines when it loads. `lvim.start()`
+  -- calls `lvim.lsp.setup()`, which calls `handlers.make_capabilities()`,
+  -- which `pcall(require, "blink.cmp")` to fold blink's completion
+  -- capabilities into the table handed to every server — and that require
+  -- trips lazy.nvim's loader during startup on any install where lspconfig is
+  -- present. So blink is typically already loaded before InsertEnter ever
+  -- fires. That is the correct trade: a server told at attach time that the
+  -- client lacks snippet/resolve support will not send those completions
+  -- later, so the capabilities have to be right before the first attach, not
+  -- merely before the first keystroke. The events remain as the backstop that
+  -- guarantees a load even when the LSP stack is disabled entirely.
+  {
+    "saghen/blink.cmp",
+    name = "cmp",
+    enabled = gate("cmp"),
+    version = "*",
+    event = { "InsertEnter", "CmdlineEnter" },
+    opts = {},
+    config = setup("cmp"),
+  },
+
+  -- Linter dispatcher. Backs the LunarVim `lvim.lsp.null-ls.linters`
+  -- compatibility shim (`lua/lvim/lsp/null-ls/linters.lua`) the same way
+  -- conform.nvim backs the formatters shim: the shim records the user's
+  -- `linters.setup{{ name = "eslint_d", filetypes = {...} }}` registrations
+  -- and requires `lvim/plugins/modules/lint.lua`, which trips lazy.nvim's
+  -- require-interceptor and pushes the registry into `linters_by_ft`.
+  --
+  -- `lazy = true` with no event trigger, loaded on demand by an explicit
+  -- require from `lvim/plugins/modules/lint.lua`.
+  --
+  -- The sequencing is the subtle part. `linters.setup{}` is called from the
+  -- user's config.lua, which `lvim.start()` runs BEFORE
+  -- `plugins.bootstrap()`/`plugins.load()`. At that moment lazy.nvim is not on
+  -- the runtimepath, so the shim's `require("lint")` cannot resolve and simply
+  -- records the registration. `lvim.start()` therefore re-enters the module
+  -- once, after `plugins.load()`, and that second pass is what actually
+  -- applies the registry.
+  --
+  -- An event trigger was tried here and reverted: `event = "BufReadPost"`
+  -- loads nvim-lint on the first buffer read whether or not the user has
+  -- registered anything, and the added synchronous work at that point pushed
+  -- gitsigns' attach past the integration smoke's 2s window. Loading strictly
+  -- on demand costs nothing for the majority of users who register no linters.
+  --
+  -- No `name`/`enabled` gate, matching conform: there is no
+  -- `lvim.builtin.lint.active` toggle because the plugin's behavior is
+  -- entirely determined by what the user registered. An empty registry means
+  -- the plugin is never even required.
+  {
+    "mfussenegger/nvim-lint",
+    lazy = true,
+    opts = {},
+    config = setup("lint"),
+  },
+
   -- Winbar breadcrumbs via SmiteshP/nvim-navic. Loaded lazily: the LSP
   -- on_attach callback in `lua/lvim/lsp/handlers.lua` calls
   -- `require('nvim-navic')` only after a server attaches AND

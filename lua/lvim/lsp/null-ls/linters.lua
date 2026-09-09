@@ -1,26 +1,23 @@
 -- LunarVim `lvim.lsp.null-ls.linters` compat shim.
 --
--- STUBBED: nvim-lint (the modern linting replacement for null-ls's diagnostic
--- sources) is not wired through LunaVim yet. The user's CKLunarVim config
--- does not register linters, and adding nvim-lint as a transitive dependency
--- would double the surface area of the null-ls compat task. Calling
--- `linters.setup{}` records the registrations to the shared registry (so a
--- future linter backend can pick them up) and emits a one-shot vim.notify
--- so a user who DOES try to register a linter learns it's a no-op rather
--- than silently losing their config.
+-- `linters.setup{}` accepts the null-ls registration shape LunarVim users
+-- already write in their config.lua:
 --
--- To fully wire this:
---   1. Add `mfussenegger/nvim-lint` to `lua/lvim/plugins/spec.lua` (lazy
---      on `BufReadPre`/`BufWritePost`).
---   2. Create `lua/lvim/plugins/modules/nvim_lint.lua` that reads
---      `_G.lvim._null_ls_registry.linters` and assigns to
---      `require("lint").linters_by_ft`.
---   3. Register a `BufWritePost`/`BufReadPost` autocmd that calls
---      `require("lint").try_lint()`.
+--   require("lvim.lsp.null-ls.linters").setup {
+--     { name = "eslint_d", filetypes = { "typescript", "typescriptreact" } },
+--     { name = "shellcheck", filetypes = { "sh" }, extra_args = { "--severity", "warning" } },
+--   }
+--
+-- Registrations are recorded into the shared `_G.lvim._null_ls_registry` and
+-- handed to `lvim/plugins/modules/lint.lua`, which translates them into
+-- nvim-lint's `linters_by_ft` and arms the autocmd that runs them. See that
+-- module for the full null-ls -> nvim-lint translation contract, including
+-- the one field (`condition`) that has no nvim-lint equivalent.
+--
+-- `list_registered`/`list_supported` report what this shim has been given, so
+-- a config that introspects its own linter set keeps working.
 
 local M = {}
-
-local notified_stub = false
 
 local function ensure_registry()
   _G.lvim = _G.lvim or {}
@@ -66,14 +63,13 @@ function M.setup(linter_configs)
     end
   end
 
-  if not notified_stub then
-    notified_stub = true
-    vim.notify(
-      "lvim.lsp.null-ls.linters: linter registrations recorded but no backend is wired. "
-        .. "Install and configure nvim-lint manually for now; see "
-        .. "lua/lvim/lsp/null-ls/linters.lua for wiring notes.",
-      vim.log.levels.WARN
-    )
+  -- Hand the updated registry to the nvim-lint backend. Requiring the module
+  -- also trips lazy.nvim's require-interceptor, which loads nvim-lint on
+  -- demand the first time a user registers a linter -- the same hand-off the
+  -- formatters shim makes to conform.nvim.
+  local ok, lint_mod = pcall(require, "lvim.plugins.modules.lint")
+  if ok then
+    lint_mod.setup({})
   end
 end
 

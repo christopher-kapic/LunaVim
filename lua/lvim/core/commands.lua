@@ -321,6 +321,20 @@ local function lvim_reload()
   -- always recreates the group with `clear = true`, so this call replaces
   -- (rather than stacks) any prior autocmd.
   require("lvim.lsp.format").setup()
+
+  -- Reconcile nvim-lint against the freshly-loaded config.
+  --
+  -- ADDING a linter already worked without this: `load_user_config()` re-runs
+  -- config.lua, whose `linters.setup{}` call hands the registry straight to the
+  -- backend. REMOVING one did not. `load_defaults()` replaces `_G.lvim` (and
+  -- with it the `_null_ls_registry`), so after a reload that deleted the
+  -- registration nothing re-enters the backend at all, and the previous
+  -- session's `linters_by_ft` and `lvim_nvim_lint` autocmd keep linting against
+  -- a config that no longer asks for it. This call closes that gap; the module
+  -- clears its own state when the registry is empty and nvim-lint is loaded,
+  -- and stays out of the way entirely when it was never loaded.
+  require("lvim.plugins.modules.lint").setup({})
+
   vim.notify("LvimReload OK", vim.log.levels.INFO)
 end
 

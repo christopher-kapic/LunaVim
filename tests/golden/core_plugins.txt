@@ -18,4 +18,6 @@ goolord/alpha-nvim
 echasnovski/mini.nvim
 lukas-reineke/indent-blankline.nvim
 stevearc/conform.nvim
+saghen/blink.cmp
+mfussenegger/nvim-lint
 SmiteshP/nvim-navic

@@ -1,78 +1,52 @@
--- LunarVim `lvim.lsp.null-ls.code_actions` compat shim.
+-- Deprecation stub for LunarVim's `lvim.lsp.null-ls.code_actions`.
 --
--- STUBBED: conform.nvim does not handle code actions (it's a formatter-only
--- plugin). null-ls's original code-action sources have been superseded by
--- per-language-server LSP code actions: the eslint LSP exposes
--- `source.fixAll.eslint`, the typescript LSP exposes its own import-organize
--- and quick-fix actions, etc. There is no single drop-in replacement plugin
--- equivalent to null-ls's code_actions catalog.
+-- There is no backend behind this module and there will not be one. null-ls's
+-- code-action sources were largely a workaround for language servers that did
+-- not implement `textDocument/codeAction`; the servers LunaVim installs through
+-- mason (eslint, ts_ls, gopls, ...) implement it natively, so those actions
+-- already reach the user through `vim.lsp.buf.code_action()` on `<leader>la`.
 --
--- The user's CKLunarVim config does not register any code actions, so this
--- shim's only job is to not crash a config that *would* register them.
--- Registrations are recorded into the shared registry (so a future backend
--- could pick them up) and a one-shot vim.notify warns that the registration
--- is inert. `list_registered` returns the recorded names so user code that
--- introspects the registry sees what it asked for.
+-- The module exists purely so a migrated LunarVim config keeps loading. Deleting
+-- it outright is tempting -- it does nothing -- but `config.lua` is executed as
+-- a single chunk, so a `module not found` error on this line aborts every line
+-- AFTER it too. The user does not get a clean failure; they get a silently
+-- half-applied config, with the error naming a module rather than the setting
+-- that quietly never took effect.
+--
+-- So: accept the call, do nothing with it, and say so once. Registrations are
+-- deliberately NOT recorded. A registry nothing consumes would imply a backend
+-- that is coming, and `list_registered` returning entries that never run is a
+-- worse lie than returning nothing.
 
 local M = {}
 
-local notified_stub = false
+local warned = false
 
-local function ensure_registry()
-  _G.lvim = _G.lvim or {}
-  _G.lvim._null_ls_registry = _G.lvim._null_ls_registry
-    or {
-      formatters = {},
-      linters = {},
-      code_actions = {},
-    }
-  return _G.lvim._null_ls_registry
-end
-
-function M.list_registered(filetype)
-  local out = {}
-  for _, entry in ipairs(ensure_registry().code_actions) do
-    if entry.name and type(entry.filetypes) == "table" then
-      for _, ft in ipairs(entry.filetypes) do
-        if ft == filetype then
-          table.insert(out, entry.name)
-          break
-        end
-      end
-    end
-  end
-  return out
-end
-
--- No equivalent of `list_supported` is exposed by LunarVim's
--- `code_actions.lua` (only `list_registered` and `setup`), but the umbrella
--- comment in this directory promises the trio for consistency. Same
--- partial semantics as the sibling shims: returns user-registered names.
-function M.list_supported(filetype)
-  return M.list_registered(filetype)
-end
-
-function M.setup(actions_configs)
-  if type(actions_configs) ~= "table" or vim.tbl_isempty(actions_configs) then
+local function warn_once()
+  if warned then
     return
   end
-
-  local registry = ensure_registry().code_actions
-  for _, entry in ipairs(actions_configs) do
-    if type(entry) == "table" and entry.name then
-      table.insert(registry, vim.deepcopy(entry))
-    end
-  end
-
-  if not notified_stub then
-    notified_stub = true
+  warned = true
+  vim.schedule(function()
     vim.notify(
-      "lvim.lsp.null-ls.code_actions: code-action registrations recorded but no backend is wired. "
-        .. "Modern code actions come from LSP servers (eslint, typescript) directly; "
-        .. "this shim is provided for null-ls API compatibility only.",
+      "lvim.lsp.null-ls.code_actions is a no-op in LunaVim. Modern language servers provide "
+        .. "code actions directly -- use `<leader>la` (vim.lsp.buf.code_action). You can delete "
+        .. "the code_actions.setup{} call from your config.",
       vim.log.levels.WARN
     )
-  end
+  end)
+end
+
+function M.setup(_)
+  warn_once()
+end
+
+function M.list_registered(_)
+  return {}
+end
+
+function M.list_supported(_)
+  return {}
 end
 
 return M

@@ -9,7 +9,7 @@
 --     mason-lspconfig exception) drops only that one gate to false while
 --     every sibling gate remains true — proving each entry's wiring is
 --     independent and pointed at the right builtin key,
---   * exactly 16 of the 19 core entries are gated (pinned count guards
+--   * exactly 17 of the 23 core entries are gated (pinned count guards
 --     against a stray gate-removal regression that a loose `> N` floor
 --     would mask),
 --   * `gate()` defensively defaults to "enabled" when `_G.lvim` is nil,
@@ -202,16 +202,20 @@ describe("plugin_spec", function()
         )
       end
     end
-    -- Exact count: 16 gated entries out of 19 total. The three non-gated
-    -- entries are folke/lazy.nvim, nvim-lua/plenary.nvim, and
-    -- stevearc/conform.nvim (the two colorschemes use `lazy = ...` rather
-    -- than `enabled = function()` so they don't count toward the gated
-    -- tally either, bringing the breakdown to 19 = 16 gated + 5 non-gated
-    -- infrastructure). Pinning the precise number means adding a new
+    -- Exact count: 17 gated entries out of 23 total, so 23 = 17 gated + 6
+    -- non-gated. The six non-gated entries are folke/lazy.nvim,
+    -- nvim-lua/plenary.nvim, nvim-tree/nvim-web-devicons,
+    -- folke/tokyonight.nvim, stevearc/conform.nvim and
+    -- mfussenegger/nvim-lint. The colorscheme and the icon provider use
+    -- `lazy = true` rather than `enabled = function()`, and conform and
+    -- nvim-lint are ungated on purpose (their behavior is driven entirely
+    -- by what the user registered through the null-ls compat shims, so
+    -- there is no `lvim.builtin.<name>.active` for either). Pinning the
+    -- precise number means adding a new
     -- gated entry without updating this test forces a deliberate touch
     -- here, and conversely a stray gate-removal regression is caught
     -- immediately rather than masked by a loose `> 10` floor.
-    assert.equals(16, gated_count)
+    assert.equals(17, gated_count)
 
     -- Flip telescope off — only telescope's `enabled()` should report
     -- false; sibling gates must still report true.
@@ -236,7 +240,7 @@ describe("plugin_spec", function()
     -- remains true. The "each gated entry's enabled() reflects ..." test
     -- above only flips telescope as a canary; this test exhaustively
     -- iterates every gated entry so the per-key wiring is pinned for
-    -- ALL 16 gates, not just one.
+    -- ALL 17 gates, not just one.
     --
     -- Most gated entries use `enabled = gate(entry.name)`. The documented
     -- exception is mason-lspconfig: its name is "mason-lspconfig" but its
@@ -260,7 +264,7 @@ describe("plugin_spec", function()
     end
 
     local entries = gated_entries()
-    assert.equals(16, #entries)
+    assert.equals(17, #entries)
 
     for _, target in ipairs(entries) do
       local target_key = gate_key_for[target.name] or target.name
@@ -474,11 +478,11 @@ describe("plugin_spec", function()
         table.insert(named_targets, entry.name)
       end
     end
-    -- 15 = 16 gated entries minus mason-lspconfig (handled by the
+    -- 16 = 17 gated entries minus mason-lspconfig (handled by the
     -- dedicated cascade test). If this floor moves, update both this
     -- count and the rationale comment above so the exclusion stays
     -- documented.
-    assert.equals(15, #named_targets)
+    assert.equals(16, #named_targets)
 
     local baseline = #plugins.final_spec()
     local baseline_names = names_in(plugins.final_spec())
@@ -563,7 +567,7 @@ describe("plugin_spec", function()
     -- With every name-keyed `lvim.builtin.<name>.active` flipped off,
     -- the filter should drop every name-keyed entry and leave behind
     -- only the non-gated infrastructure plugins (lazy.nvim + plenary.nvim
-    -- + the two bundled colorschemes + conform.nvim). This proves the gate
+    -- + tokyonight + web-devicons + conform.nvim + nvim-lint). This proves the gate
     -- set covers every name-keyed entry and that no core plugin sneaks
     -- past the toggle by lacking a `name`.
     --
@@ -584,19 +588,19 @@ describe("plugin_spec", function()
     end
 
     local residual = plugins.final_spec()
-    -- Five infrastructure entries remain: folke/lazy.nvim, the bundled
+    -- Six infrastructure entries remain: folke/lazy.nvim, the bundled
     -- tokyonight colorscheme, nvim-lua/plenary.nvim,
-    -- nvim-tree/nvim-web-devicons, and stevearc/conform.nvim. They are
-    -- passed through because they have no `name` field for the filter to
-    -- match against — tokyonight intentionally has no
-    -- `lvim.builtin.<x>.active` toggle since its own `lazy = ...`
-    -- condition already controls eager-load; web-devicons is a transitive
-    -- icon provider with no standalone user-facing surface; and
-    -- conform.nvim is keyed entirely by what the null-ls compat shim
-    -- registers (an empty registry makes its BufWritePre callback a
-    -- no-op) so a builtin toggle would be redundant with the shim's own
-    -- opt-in surface.
-    assert.equals(5, #residual)
+    -- nvim-tree/nvim-web-devicons, stevearc/conform.nvim, and
+    -- mfussenegger/nvim-lint. They are passed through because they have no
+    -- `name` field for the filter to match against — tokyonight
+    -- intentionally has no `lvim.builtin.<x>.active` toggle since its own
+    -- `lazy = ...` condition already controls eager-load; web-devicons is a
+    -- transitive icon provider with no standalone user-facing surface; and
+    -- conform.nvim and nvim-lint are keyed entirely by what the null-ls
+    -- compat shims register (an empty registry makes conform's BufWritePre
+    -- callback and nvim-lint's `try_lint()` no-ops) so a builtin toggle
+    -- would be redundant with the shims' own opt-in surface.
+    assert.equals(6, #residual)
     local repos = {}
     for _, entry in ipairs(residual) do
       repos[entry[1]] = true

@@ -40,11 +40,57 @@ function M.make_on_attach()
     local function map(mode, lhs, rhs, desc)
       vim.keymap.set(mode, lhs, rhs, { buffer = bufnr, noremap = true, silent = true, desc = desc })
     end
-    map("n", "gd", vim.lsp.buf.definition, "Goto definition")
-    map("n", "gr", vim.lsp.buf.references, "Goto references")
-    map("n", "K", vim.lsp.buf.hover, "Hover")
-    map("n", "<leader>la", vim.lsp.buf.code_action, "Code action")
-    map("n", "<leader>lr", vim.lsp.buf.rename, "Rename")
+    -- Apply `lvim.lsp.buffer_mappings.<mode>` rather than a hardcoded set, so
+    -- a user can retarget or drop an individual key from config.lua without
+    -- having to supply a replacement `lvim.lsp.on_attach` (which previously
+    -- was the only way to change `gd`/`gr`/`K`). Modes are named with the same
+    -- `<x>_mode` vocabulary as `lvim.keys`, translated through the same
+    -- adapter table, so the two surfaces stay consistent.
+    --
+    -- An entry of `false` suppresses the buffer-local mapping, and deletes one
+    -- if a previous `on_attach` on this buffer already created it (a second
+    -- server attaching to the same buffer re-runs this function).
+    --
+    -- Caveat worth stating plainly: `false` removes the BUFFER-LOCAL mapping
+    -- only. If the same LHS is also bound globally, Neovim falls through to the
+    -- global mapping and the key keeps working. That applies to `<leader>la`
+    -- and `<leader>lr`, which `lvim.builtin.whichkey.mappings` also registers
+    -- globally, so switching those off takes two edits:
+    --
+    --   lvim.lsp.buffer_mappings.normal_mode["<leader>la"] = false
+    --   -- and remove the matching entry from lvim.builtin.whichkey.mappings
+    --
+    -- The `g`-prefixed keys and `K` have no global counterpart, so `false`
+    -- fully removes those.
+    local mode_adapters = {
+      normal_mode = "n",
+      insert_mode = "i",
+      visual_mode = "v",
+      visual_block_mode = "x",
+      command_mode = "c",
+      operator_pending_mode = "o",
+      term_mode = "t",
+    }
+
+    local buffer_mappings = ((_G.lvim or {}).lsp or {}).buffer_mappings or {}
+    for mode_name, mappings in pairs(buffer_mappings) do
+      local mode = mode_adapters[mode_name] or mode_name
+      for lhs, entry in pairs(mappings) do
+        if entry == false then
+          pcall(vim.api.nvim_buf_del_keymap, bufnr, mode, lhs)
+        elseif entry ~= nil then
+          local rhs, desc
+          if type(entry) == "table" then
+            rhs, desc = entry[1], entry[2]
+          else
+            rhs = entry
+          end
+          if rhs then
+            map(mode, lhs, rhs, desc)
+          end
+        end
+      end
+    end
 
     local breadcrumbs = (_G.lvim and _G.lvim.builtin and _G.lvim.builtin.breadcrumbs) or {}
     if

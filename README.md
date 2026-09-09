@@ -42,7 +42,7 @@ surfaces are still `lvim` — old muscle memory carries over.
 One-liner (downloads and runs [`scripts/install.sh`](scripts/install.sh)):
 
 ```bash
-curl -L https://raw.githubusercontent.com/christopher-kapic/LunaVim/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/christopher-kapic/LunaVim/master/scripts/install.sh | bash
 ```
 
 This clones LunaVim into `~/.local/share/lunavim`, installs the core
@@ -72,7 +72,7 @@ Two options, both safe to re-run:
   and exits.
 
 ```bash
-curl -L https://raw.githubusercontent.com/christopher-kapic/LunaVim/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/christopher-kapic/LunaVim/master/scripts/install.sh | bash
 ```
 
 After updating LunaVim itself, run `:LvimSyncCorePlugins` inside Neovim

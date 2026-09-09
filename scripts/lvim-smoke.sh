@@ -59,6 +59,26 @@ make_empty_config_dir() {
   printf '%s\n' "$dir"
 }
 
+# A throwaway LUNAVIM_BASE_DIR whose snapshots/default.json is `{}`.
+#
+# `:LvimSyncCorePlugins` branches on the snapshot: a populated one prompts
+# "overwrite your lazy-lock.json?" and then calls `lazy.restore()`, while an
+# empty one goes straight to `lazy.sync()` with no prompt. Checks that want to
+# observe the sync path (or that simply must not block on a confirm a headless
+# run cannot answer) point LUNAVIM_BASE_DIR here.
+#
+# This exists because those checks were originally written when the shipped
+# `snapshots/default.json` was itself `{}`. Once it gained real commit pins,
+# every one of them started hitting the confirm, cancelling, and reporting a
+# failure against correct code.
+make_empty_snapshot_base_dir() {
+  local dir
+  dir="$(mktemp -d -p "$SMOKE_TMP_BASE" empty-snap-base-XXXXXX)"
+  mkdir -p "$dir/snapshots"
+  printf '{}\n' > "$dir/snapshots/default.json"
+  printf '%s\n' "$dir"
+}
+
 # A config dir whose config.lua is the sample fixture, used by
 # check_user_config_applied to verify the loader actually applies user config.
 make_sample_config_dir() {
@@ -746,8 +766,25 @@ local function event_has(p, want) \
 end; \
 local ok = true; \
 local function check(cond, msg) if not cond then ok = false; print('FAIL ' .. msg) end end; \
-check(idx.treesitter ~= nil and idx.treesitter.branch == 'master', 'treesitter.branch must be master (main requires 0.12)'); \
-check(idx.treesitter ~= nil and idx.treesitter.build == ':TSUpdate', 'treesitter.build must be :TSUpdate'); \
+local ts_want = vim.fn.has('nvim-0.12') == 1 and 'main' or 'master'; \
+check(idx.treesitter ~= nil and idx.treesitter.branch == ts_want, 'treesitter.branch must be ' .. ts_want .. ' on this Neovim'); \
+check(idx.treesitter ~= nil and type(idx.treesitter.build) == 'function', 'treesitter.build must be a function'); \
+local ts_build_gated = false; \
+if idx.treesitter and type(idx.treesitter.build) == 'function' then \
+  local saw = false; \
+  local real_cmd, real_exec = vim.cmd, vim.fn.executable; \
+  vim.cmd = function(c) if c == 'TSUpdate' then saw = true end end; \
+  vim.fn.executable = function(_) return 0 end; \
+  pcall(idx.treesitter.build); \
+  local without_cli = saw; \
+  saw = false; \
+  vim.fn.executable = function(_) return 1 end; \
+  pcall(idx.treesitter.build); \
+  local with_cli = saw; \
+  vim.cmd, vim.fn.executable = real_cmd, real_exec; \
+  ts_build_gated = (without_cli == false and with_cli == true); \
+end; \
+check(ts_build_gated, 'treesitter.build must invoke TSUpdate only when the tree-sitter CLI is present'); \
 check(idx.treesitter ~= nil and event_has(idx.treesitter, 'BufReadPost'), 'treesitter event must include BufReadPost'); \
 check(idx.telescope ~= nil and cmd_has(idx.telescope, 'Telescope'), 'telescope cmd must include Telescope'); \
 check(idx.nvimtree ~= nil and cmd_has(idx.nvimtree, 'NvimTreeToggle'), 'nvimtree cmd must include NvimTreeToggle'); \
@@ -857,20 +894,60 @@ check_phase_23_lvim_reload_reapplies_config() {
 }
 
 check_phase_23_lvim_sync_core_plugins_dispatches() {
-  # Phase 2.3 acceptance: `:LvimSyncCorePlugins` delegates to `lazy.sync`.
-  # We can't actually wait on a sync to network-fetch in the smoke run, so
-  # we stub `package.loaded.lazy` with a sentinel object whose `sync` method
-  # flips a flag; running the command must call our stub.
-  local cfg_dir output
-  cfg_dir="$(make_empty_config_dir)"
+  # Phase 2.3 acceptance: `:LvimSyncCorePlugins` delegates to lazy.nvim.
+  # Which entry point it delegates to depends on the snapshot, and both
+  # branches are pinned here:
+  #
+  #   * snapshot present and non-empty -> write it over the user's
+  #     lazy-lock.json, then `lazy.restore()` so the pinned commits are
+  #     checked out. This is the normal path and the reason the snapshot
+  #     exists at all.
+  #   * snapshot missing or empty -> `lazy.sync()`, because there is
+  #     nothing to restore to and the user still expects the command to
+  #     bring plugins up to date.
+  #
+  # We cannot let a real sync network-fetch inside the smoke run, so
+  # `package.loaded.lazy` is stubbed with sentinels for both methods.
+  # The `!` bang skips the "overwrite your lockfile?" confirm, which would
+  # otherwise block on a prompt no headless run can answer (and which is
+  # what made an earlier version of this check report a false failure).
+  local cfg_dir output stub
 
+  stub='lua _G.__sync = false; _G.__restore = false; package.loaded.lazy = { sync = function() _G.__sync = true end, restore = function() _G.__restore = true end, stats = function() return { count = 0 } end }'
+
+  # Branch 1: the repository's real, non-empty snapshot -> restore.
+  cfg_dir="$(make_empty_config_dir)"
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
-    -c 'lua _G.__lvim_sync_called = false; package.loaded.lazy = { sync = function() _G.__lvim_sync_called = true end, stats = function() return { count = 0 } end }' \
-    -c 'LvimSyncCorePlugins' \
-    -c 'lua print("SYNC_CALLED=" .. tostring(_G.__lvim_sync_called))' \
+    -c "$stub" \
+    -c 'LvimSyncCorePlugins!' \
+    -c 'lua print("SYNC=" .. tostring(_G.__sync) .. " RESTORE=" .. tostring(_G.__restore))' \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^SYNC_CALLED=true$' <<<"$output"; then
-    printf 'phase 2.3 LvimSyncCorePlugins did not dispatch to lazy.sync (output: %s)\n' "$output" >&2
+  if ! grep -q '^SYNC=false RESTORE=true$' <<<"$output"; then
+    printf 'phase 2.3 LvimSyncCorePlugins did not restore from a non-empty snapshot (output: %s)\n' "$output" >&2
+    return 1
+  fi
+  # The lockfile must have been written with the snapshot's contents.
+  if ! cmp -s "$cfg_dir/lazy-lock.json" snapshots/default.json; then
+    printf 'phase 2.3 LvimSyncCorePlugins did not copy the snapshot onto %s\n' "$cfg_dir/lazy-lock.json" >&2
+    return 1
+  fi
+
+  # Branch 2: an empty snapshot -> sync. LUNAVIM_BASE_DIR is pointed at a
+  # scratch tree carrying an empty snapshots/default.json, so the command
+  # resolves that file instead of the repository's real one.
+  local fake_base
+  fake_base="$(mktemp -d -p "$SMOKE_TMP_BASE" lvim-emptysnap-XXXXXX)"
+  mkdir -p "$fake_base/snapshots"
+  printf '{}\n' > "$fake_base/snapshots/default.json"
+
+  cfg_dir="$(make_empty_config_dir)"
+  output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" LUNAVIM_BASE_DIR="$fake_base" nvim --headless -u init.lua \
+    -c "$stub" \
+    -c 'LvimSyncCorePlugins!' \
+    -c 'lua print("SYNC=" .. tostring(_G.__sync) .. " RESTORE=" .. tostring(_G.__restore))' \
+    -c 'qall!' 2>&1)"
+  if ! grep -q '^SYNC=true RESTORE=false$' <<<"$output"; then
+    printf 'phase 2.3 LvimSyncCorePlugins did not fall back to lazy.sync on an empty snapshot (output: %s)\n' "$output" >&2
     return 1
   fi
 }
@@ -998,17 +1075,29 @@ check_phase_24_snapshot_artifacts_present() {
 }
 
 check_phase_24_lvim_sync_core_plugins_initial_no_error() {
-  # Phase 2.4 acceptance: literal invocation must not error. With the
-  # shipped (empty `{}`) snapshot the command falls back to
-  # `lazy.sync()`; we stub `lazy` so the call records but no network
-  # traffic happens (the smoke run must not depend on cloning every core
-  # plugin). The acceptance is "no error in output" — we check both rc
-  # and the absence of any `E\d+:` / `Error detected` markers.
-  local cfg_dir output rc
+  # Phase 2.4 acceptance: literal invocation (no bang) must not error.
+  #
+  # The empty-snapshot fallback is the branch exercised here, so the base
+  # dir is pointed at a scratch tree carrying `snapshots/default.json` =
+  # `{}`. When this check was written the SHIPPED snapshot was itself `{}`
+  # and no isolation was needed; it has since been populated with real
+  # commit pins, which made the un-isolated version of this check hit the
+  # "overwrite your lockfile?" confirm and report a false failure. Pinning
+  # the fallback against a snapshot we control keeps the assertion honest
+  # regardless of what the repository's real snapshot contains.
+  #
+  # `lazy` is stubbed so the call records but no network traffic happens
+  # (the smoke run must not depend on cloning every core plugin). The
+  # acceptance is "no error in output" — we check both rc and the absence
+  # of any `E\d+:` / `Error detected` markers.
+  local cfg_dir output rc fake_base
   cfg_dir="$(make_empty_config_dir)"
+  fake_base="$(mktemp -d -p "$SMOKE_TMP_BASE" lvim-24-emptysnap-XXXXXX)"
+  mkdir -p "$fake_base/snapshots"
+  printf '{}\n' > "$fake_base/snapshots/default.json"
 
   set +e
-  output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
+  output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" LUNAVIM_BASE_DIR="$fake_base" nvim --headless -u init.lua \
     -c 'lua _G.__lvim_sync_called = false; package.loaded.lazy = { sync = function() _G.__lvim_sync_called = true end, restore = function() _G.__lvim_restore_called = true end, stats = function() return { count = 0 } end }' \
     -c 'LvimSyncCorePlugins' \
     -c 'lua print("SYNC=" .. tostring(_G.__lvim_sync_called) .. " RESTORE=" .. tostring(_G.__lvim_restore_called))' \
@@ -1026,7 +1115,7 @@ check_phase_24_lvim_sync_core_plugins_initial_no_error() {
     return 1
   fi
 
-  # Initial snapshot is empty `{}`, so the sync path runs.
+  # The isolated snapshot is empty `{}`, so the sync path runs.
   if ! grep -q 'SYNC=true' <<<"$output"; then
     printf 'phase 2.4: empty snapshot did not fall back to lazy.sync() (output: %s)\n' "$output" >&2
     return 1
@@ -1090,42 +1179,87 @@ check_phase_24_non_empty_snapshot_restores() {
 }
 
 check_phase_24_snapshot_export_script_copies_lockfile() {
-  # Phase 2.4 acceptance for scripts/snapshot-export.sh: it must copy
-  # `<config>/lazy-lock.json` onto `snapshots/default.json`. The script
-  # resolves its destination relative to its own location
-  # (`SCRIPT_DIR/../snapshots/default.json`, see
-  # scripts/snapshot-export.sh:36-41), so we copy the script into a
-  # throwaway fake repo (with its own scripts/ + snapshots/ layout) and
-  # run the copy from there. That way the test exercises the script
-  # against an isolated destination — the real `snapshots/default.json`
-  # in the working tree is never touched, so an interrupt mid-test
-  # cannot leave the tracked file dirty.
-  local cfg_dir fake_repo expected actual
+  # Phase 2.4 acceptance for scripts/snapshot-export.sh: it must write
+  # `<config>/lazy-lock.json` onto `snapshots/default.json`, FILTERED down
+  # to the plugins in LunaVim's own core spec.
+  #
+  # The filter is the point of the script. A verbatim copy is what let
+  # `git-blame.nvim` and `mini.map` — two plugins in no LunaVim spec, added
+  # by the exporting maintainer through `lvim.plugins` — get pinned into the
+  # shipped snapshot and pushed at every `:LvimSyncCorePlugins` user. So the
+  # assertions here are: a core plugin survives, a non-core plugin is
+  # dropped, and nvim-treesitter is dropped even though it IS core (its
+  # branch is chosen by Neovim version, so a single pinned commit is wrong
+  # for one of the two supported versions).
+  #
+  # The script resolves its destination relative to its own location
+  # (`SCRIPT_DIR/../snapshots/default.json`), so we build a throwaway fake
+  # repo and run it from there — the real `snapshots/default.json` in the
+  # working tree is never touched, so an interrupt mid-test cannot leave the
+  # tracked file dirty. The fake repo needs `lua/` as well as `scripts/` and
+  # `snapshots/`, because the allow-list is derived by asking a headless
+  # Neovim to load `lvim.plugins.spec` from that tree.
+  local cfg_dir fake_repo actual rc
   cfg_dir="$(mktemp -d -p "$SMOKE_TMP_BASE" export-cfg-XXXXXX)"
   fake_repo="$(mktemp -d -p "$SMOKE_TMP_BASE" export-repo-XXXXXX)"
   mkdir -p "$fake_repo/scripts" "$fake_repo/snapshots"
   cp scripts/snapshot-export.sh "$fake_repo/scripts/snapshot-export.sh"
   chmod +x "$fake_repo/scripts/snapshot-export.sh"
-  # Seed the fake repo's snapshot with the empty initial state so the
-  # write is observable as a content change (the assertion below compares
-  # against the fixture contents).
+  cp -R lua "$fake_repo/lua"
   printf '{}\n' > "$fake_repo/snapshots/default.json"
-  cp tests/fixtures/lazy-lock.json "$cfg_dir/lazy-lock.json"
+
+  # A lock carrying several core plugins, two plugins in no spec, and
+  # treesitter. Multiple core entries matter: with only one, an exporter that
+  # dropped almost everything would still pass.
+  cat > "$cfg_dir/lazy-lock.json" <<'LOCKEOF'
+{
+  "lazy.nvim": { "branch": "main", "commit": "85c7ff3711b730b4030d03144f6db6375044ae82" },
+  "telescope": { "branch": "master", "commit": "7d324792b7943e4aa16ad007212e6acc6f9fe335" },
+  "mason": { "branch": "main", "commit": "bb639d4bf385a4d89f478b83af4d770be05ab7eb" },
+  "cmp": { "branch": "main", "commit": "78336bc89ee5365633bcf754d93df01678b5c08f" },
+  "whichkey": { "branch": "main", "commit": "3aab2147e74890957785941f0c1ad87d0a44c15a" },
+  "mini.map": { "branch": "stable", "commit": "234eaf5cbcaee320d87e96465fbb534aa05b301e" },
+  "git-blame.nvim": { "branch": "main", "commit": "5c536e2d4134d064aa3f41575280bc8a2a0e03d7" },
+  "treesitter": { "branch": "main", "commit": "4916d6592ede8c07973490d9322f187e07dfefac" }
+}
+LOCKEOF
 
   set +e
   LUNAVIM_CONFIG_DIR="$cfg_dir" "$fake_repo/scripts/snapshot-export.sh" >/dev/null 2>&1
-  local rc=$?
+  rc=$?
   set -e
-
-  expected="$(cat tests/fixtures/lazy-lock.json)"
-  actual="$(cat "$fake_repo/snapshots/default.json" 2>/dev/null || true)"
 
   if (( rc != 0 )); then
     printf 'phase 2.4: snapshot-export.sh exited non-zero (rc=%d)\n' "$rc" >&2
     return 1
   fi
-  if [[ "$expected" != "$actual" ]]; then
-    printf 'phase 2.4: snapshot-export.sh did not copy lockfile contents into snapshots/default.json\n' >&2
+
+  actual="$(cat "$fake_repo/snapshots/default.json" 2>/dev/null || true)"
+
+  # Assert the exact expected key set AND that each surviving entry kept its
+  # branch/commit pin verbatim. Grepping for a single key let an exporter that
+  # discarded every other core plugin -- or that wrote `null` pins -- pass.
+  if ! EXPECTED_KEPT='lazy.nvim,telescope,mason,cmp,whichkey' \
+       SRC_LOCK="$cfg_dir/lazy-lock.json" \
+       python3 - "$fake_repo/snapshots/default.json" <<'VERIFYEOF'
+import json, os, sys
+
+out = json.load(open(sys.argv[1]))
+src = json.load(open(os.environ["SRC_LOCK"]))
+expected = set(os.environ["EXPECTED_KEPT"].split(","))
+
+got = set(out)
+if got != expected:
+    print("key set mismatch: expected %s, got %s" % (sorted(expected), sorted(got)))
+    raise SystemExit(1)
+
+for name in sorted(expected):
+    if out[name] != src[name]:
+        print("pin for %s was altered: %r -> %r" % (name, src[name], out[name]))
+        raise SystemExit(1)
+VERIFYEOF
+  then
+    printf 'phase 2.4: snapshot-export.sh produced the wrong filtered snapshot (got: %s)\n' "$actual" >&2
     return 1
   fi
 }
@@ -2269,12 +2403,21 @@ LUA
 }
 
 check_phase_42_default_on_attach_registers_keymaps() {
-  # Phase 4.2 step 2: the default on_attach registers buffer-local LSP keymaps
-  # gd / gr / K / <leader>la / <leader>lr. Invoke `handlers.make_on_attach()`
-  # directly against a scratch buffer so we don't need a live LSP client, then
-  # walk `vim.api.nvim_buf_get_keymap(bufnr, 'n')` and assert each LHS is
-  # present. A regression that dropped a key — or registered a global mapping
-  # instead of a buffer-local one — would trip the anchored grep.
+  # Phase 4.2 step 2: the default on_attach registers buffer-local LSP keymaps.
+  #
+  # The set is no longer hardcoded in `handlers.make_on_attach()` — it is
+  # driven by `lvim.lsp.buffer_mappings.<mode>`, so a user can retarget or
+  # drop an individual key from config.lua without supplying a whole
+  # replacement `on_attach`. This check therefore pins the DEFAULT contents of
+  # that table: the seven LSP navigation keys plus the two leader bindings.
+  #
+  # Invoke `handlers.make_on_attach()` directly against a scratch buffer so we
+  # don't need a live LSP client, then walk
+  # `vim.api.nvim_buf_get_keymap(bufnr, 'n')` and assert each LHS is present.
+  # A regression that dropped a key — or registered a global mapping instead
+  # of a buffer-local one — would trip the anchored grep. Note the leader keys
+  # appear as ' la' / ' lr' because `<leader>` is resolved to a literal space
+  # at map-creation time.
   local cfg_dir output
   cfg_dir="$(make_empty_config_dir)"
 
@@ -2285,9 +2428,13 @@ require('lvim.lsp.handlers').make_on_attach()(nil, bufnr); \
 local maps = vim.api.nvim_buf_get_keymap(bufnr, 'n'); \
 local seen = {}; \
 for _, m in ipairs(maps) do seen[m.lhs] = true end; \
-print('KEYS', seen['gd'] == true, seen['gr'] == true, seen['K'] == true, seen[' la'] == true, seen[' lr'] == true)" \
+local want = { 'gd', 'gD', 'gr', 'gI', 'gs', 'gl', 'K', ' la', ' lr' }; \
+local all = true; \
+local missing = {}; \
+for _, k in ipairs(want) do if seen[k] ~= true then all = false; missing[#missing + 1] = k end end; \
+print('KEYS', all, table.concat(missing, ','))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^KEYS[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^KEYS[[:space:]]+true[[:space:]]*$' <<<"$output"; then
     printf 'phase 4.2: default on_attach did not register expected buffer-local keymaps (output: %s)\n' \
       "$output" >&2
     return 1
@@ -2953,21 +3100,29 @@ check_phase_44_lazydev_setup_library_defaults() {
 }
 
 check_phase_44_lazydev_setup_user_opts_merged() {
-  # The lazydev module must deep-merge user-supplied opts with its defaults so
-  # a caller passing extra `integrations` or `library` entries does not lose
-  # the VIMRUNTIME / lvim base dir defaults. Exercise this by passing a user
-  # opts table with an extra library entry (as a plain string, to prove that
-  # form still flows through unchanged) plus an integrations toggle, then
-  # asserting all three library paths AND the integration flag are present
-  # in the captured opts. The lvim base dir is matched against either a plain
-  # string or a `{ path = ... }` table since the default shape uses the
-  # `words`-trigger form.
+  # The lazydev module must merge the USER's configuration with its own
+  # defaults, so a user adding `integrations` or extra `library` entries does
+  # not lose the VIMRUNTIME / lvim base dir defaults.
+  #
+  # User configuration arrives through `lvim.builtin.lazydev`, not through the
+  # module's function argument. Every module under `lvim/plugins/modules/`
+  # takes `setup(_)` and reads its own `lvim.builtin.<name>` subtree; the
+  # argument exists only because lazy.nvim's `config = function(_, opts)` hook
+  # passes the spec's `opts = {}` through. An earlier version of this check
+  # passed a table as that argument and asserted it was merged, which pinned a
+  # second configuration path that does not exist anywhere in the codebase.
+  #
+  # Set the builtin, invoke the module, and assert all three library paths AND
+  # the integration flag reach `lazydev.setup`. The lvim base dir is matched
+  # against either a plain string or a `{ path = ... }` table since the
+  # default shape uses the `words`-trigger form.
   local cfg_dir output
   cfg_dir="$(make_empty_config_dir)"
 
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua _G.__lazydev_opts = nil; package.loaded.lazydev = { setup = function(o) _G.__lazydev_opts = o end }' \
-    -c "lua require('lvim.plugins.modules.lazydev').setup({ library = { '/tmp/extra-lib' }, integrations = { cmp = true } })" \
+    -c "lua lvim.builtin.lazydev.library = { '/tmp/extra-lib' }; lvim.builtin.lazydev.integrations = { cmp = true }" \
+    -c "lua require('lvim.plugins.modules.lazydev').setup({})" \
     -c 'lua local o = _G.__lazydev_opts; local base = _G.get_lvim_base_dir(); local has_rt, has_base, has_extra = false, false, false; for _, p in ipairs((o or {}).library or {}) do if p == vim.env.VIMRUNTIME then has_rt = true end; if p == base or (type(p) == "table" and p.path == base) then has_base = true end; if p == "/tmp/extra-lib" then has_extra = true end end; print("MERGE", has_rt, has_base, has_extra, o and o.integrations and o.integrations.cmp == true)' \
     -c 'qall!' 2>&1)"
   if ! grep -Eq '^MERGE[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
@@ -3061,15 +3216,22 @@ check_phase_44_lspconfig_does_not_set_lua_workspace_library() {
   # orchestrator and the defaults to prove no static `workspace.library` is
   # hardcoded; user config can still set one in `lvim.lsp.servers.lua_ls`,
   # which is by design.
-  if grep -F 'workspace' lua/lvim/lsp/init.lua >/dev/null 2>&1; then
+  #
+  # The pattern matches a workspace SETTING — `workspace.library`, or
+  # `workspace` as a table key — rather than the bare word. Matching the bare
+  # word made this check fire on
+  # `<cmd>Telescope lsp_dynamic_workspace_symbols<cr>` in the which-key spec,
+  # a picker name that has nothing to do with lua_ls settings.
+  local ws_pattern='workspace[[:space:]]*\.[[:space:]]*library|["'"'"']?workspace["'"'"']?[[:space:]]*=|\[["'"'"']workspace["'"'"']\]'
+  if grep -Eq "$ws_pattern" lua/lvim/lsp/init.lua 2>/dev/null; then
     printf 'phase 4.4: lua/lvim/lsp/init.lua hardcodes a workspace setting (conflicts with lazydev)\n' >&2
     return 1
   fi
-  if grep -F 'workspace' lua/lvim/lsp/handlers.lua >/dev/null 2>&1; then
+  if grep -Eq "$ws_pattern" lua/lvim/lsp/handlers.lua 2>/dev/null; then
     printf 'phase 4.4: lua/lvim/lsp/handlers.lua hardcodes a workspace setting (conflicts with lazydev)\n' >&2
     return 1
   fi
-  if grep -F 'workspace' lua/lvim/config/defaults.lua >/dev/null 2>&1; then
+  if grep -Eq "$ws_pattern" lua/lvim/config/defaults.lua 2>/dev/null; then
     printf 'phase 4.4: lua/lvim/config/defaults.lua hardcodes a workspace setting (conflicts with lazydev)\n' >&2
     return 1
   fi
@@ -3357,23 +3519,36 @@ check_phase_51_treesitter_module_present() {
 }
 
 check_phase_51_treesitter_defaults_shape() {
-  # Phase 5.1 step 1 prescribes the defaults subtree shape verbatim:
-  #   active = true, ensure_installed = {'lua','vim','vimdoc','bash','json'},
-  #   highlight = { enable = true }, indent = { enable = true },
+  # Phase 5.1 step 1 prescribes the defaults subtree shape:
+  #   active = true, ensure_installed = { 'lua', 'vim', 'vimdoc', 'bash',
+  #   'json', ... }, highlight = { enable = true }, indent = { enable = true },
   #   auto_install = true
   # A regression that dropped one of these keys (or used a different name
   # like `parsers` instead of `ensure_installed`) would silently change the
-  # surface the module forwards to nvim-treesitter.configs.setup. Pin the
-  # exact shape with a single anchored print line. The ensure_installed
-  # entries are checked via `table.concat` so insertion order is also
-  # locked down (the step lists them in a fixed order).
+  # surface the module forwards to nvim-treesitter.configs.setup.
+  #
+  # `ensure_installed` is checked as a REQUIRED SUBSET plus one invariant,
+  # not as an exact list. Pinning the exact list meant every deliberate
+  # parser addition silently broke this check: `comment`, `markdown` and
+  # `markdown_inline` were added to defaults.lua with a documented rationale
+  # and this assertion was never updated to match.
+  #
+  # The invariant that IS worth pinning: `markdown` and `markdown_inline` must
+  # BOTH be present. Asserting only that they are equal to each other let a
+  # regression deleting both slip through while the comment claimed they were
+  # required -- the check has to demand presence, not agreement. The markdown parser carries injection queries
+  # pointing into markdown_inline, and Neovim raises
+  # `attempt to call method 'range' (a nil value)` on a .md buffer when one
+  # is present without the other. `auto_install` alone would fetch markdown
+  # without the injection-only markdown_inline, so listing both is what
+  # forces a matched pair.
   local cfg_dir output
   cfg_dir="$(make_empty_config_dir)"
 
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
-    -c 'lua local t = lvim.builtin.treesitter; print(t.active, table.concat(t.ensure_installed, ","), t.highlight.enable, t.indent.enable, t.auto_install)' \
+    -c 'lua local t = lvim.builtin.treesitter; local have = {}; for _, p in ipairs(t.ensure_installed or {}) do have[p] = true end; local ok_required = true; for _, p in ipairs({ "lua", "vim", "vimdoc", "bash", "json", "comment" }) do if not have[p] then ok_required = false end end; local md_paired = (have["markdown"] == true and have["markdown_inline"] == true); print(t.active, ok_required, md_paired, t.highlight.enable, t.indent.enable, t.auto_install)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^true[[:space:]]+lua,vim,vimdoc,bash,json[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^true[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
     printf 'phase 5.1: lvim.builtin.treesitter defaults shape wrong (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3388,15 +3563,23 @@ check_phase_51_treesitter_setup_forwards_opts() {
   # directly and assert the captured opts carry the prescribed shape AND that
   # `active` was stripped (it would not be a valid nvim-treesitter.configs
   # option and a regression that forwarded it would pollute the call site).
+  #
+  # The parser-install fields are asserted conditionally on the `tree-sitter`
+  # CLI being on PATH, because the module deliberately neutralises them when
+  # it is not: `setup_master` copies the opts, empties `ensure_installed` and
+  # forces `auto_install = false` so nvim-treesitter does not attempt a build
+  # it cannot complete (it warns once instead). Asserting the populated list
+  # unconditionally made this check fail on any machine without the CLI —
+  # including CI images that do not install it.
   local cfg_dir output
   cfg_dir="$(make_empty_config_dir)"
 
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua _G.__ts_opts = nil; package.loaded["nvim-treesitter.configs"] = { setup = function(o) _G.__ts_opts = o end }' \
     -c "lua require('lvim.plugins.modules.treesitter').setup({})" \
-    -c 'lua local o = _G.__ts_opts or {}; print("CAPTURED", type(o), table.concat(o.ensure_installed or {}, ","), o.highlight and o.highlight.enable, o.indent and o.indent.enable, o.auto_install, o.active == nil)' \
+    -c 'lua local o = _G.__ts_opts or {}; local cli = vim.fn.executable("tree-sitter") == 1; local have = {}; for _, p in ipairs(o.ensure_installed or {}) do have[p] = true end; local parsers_ok; if cli then parsers_ok = (have["lua"] == true and have["vim"] == true and have["json"] == true and o.auto_install == true) else parsers_ok = (#(o.ensure_installed or {}) == 0 and o.auto_install == false) end; print("CAPTURED", type(o) == "table", parsers_ok, o.highlight and o.highlight.enable, o.indent and o.indent.enable, o.active == nil)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^CAPTURED[[:space:]]+table[[:space:]]+lua,vim,vimdoc,bash,json[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^CAPTURED[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
     printf 'phase 5.1: treesitter module did not forward lvim.builtin.treesitter (minus active) to configs.setup (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3550,9 +3733,13 @@ LUA
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua _G.__ts_user_opts = nil; package.loaded["nvim-treesitter.configs"] = { setup = function(o) _G.__ts_user_opts = o end }' \
     -c "lua require('lvim.plugins.modules.treesitter').setup({})" \
-    -c 'lua local o = _G.__ts_user_opts or {}; print("USER_TS", table.concat(o.ensure_installed or {}, ","), o.highlight and o.highlight.enable, o.indent and o.indent.enable, o.auto_install, o.active == nil)' \
+    -c 'lua local o = _G.__ts_user_opts or {}; local cli = vim.fn.executable("tree-sitter") == 1; local parsers_ok; if cli then parsers_ok = (table.concat(o.ensure_installed or {}, ",") == "python") else parsers_ok = (#(o.ensure_installed or {}) == 0) end; print("USER_TS", parsers_ok, o.highlight and o.highlight.enable, o.indent and o.indent.enable, o.auto_install, o.active == nil)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^USER_TS[[:space:]]+python[[:space:]]+false[[:space:]]+true[[:space:]]+false[[:space:]]+true$' <<<"$output"; then
+  # `auto_install` is asserted false in both worlds: the user config sets it
+  # false, and the CLI-missing path forces it false too, so the two agree.
+  # `ensure_installed` is CLI-conditional for the reason documented on
+  # check_phase_51_treesitter_setup_forwards_opts.
+  if ! grep -Eq '^USER_TS[[:space:]]+true[[:space:]]+false[[:space:]]+true[[:space:]]+false[[:space:]]+true$' <<<"$output"; then
     printf 'phase 5.1: user override of lvim.builtin.treesitter did not flow through to configs.setup (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3576,9 +3763,14 @@ check_phase_51_setup_does_not_mutate_builtin() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua package.loaded["nvim-treesitter.configs"] = { setup = function(o) o.active = "MUTATED"; if o.highlight then o.highlight.enable = "MUTATED" end end }' \
     -c "lua require('lvim.plugins.modules.treesitter').setup({})" \
-    -c 'lua local t = lvim.builtin.treesitter; print("LIVE", t.active, t.highlight.enable, t.indent.enable, t.auto_install, table.concat(t.ensure_installed, ","))' \
+    -c 'lua local t = lvim.builtin.treesitter; local have = {}; for _, p in ipairs(t.ensure_installed or {}) do have[p] = true end; print("LIVE", t.active, t.highlight.enable, t.indent.enable, t.auto_install, have["lua"] == true and have["vim"] == true)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^LIVE[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+lua,vim,vimdoc,bash,json$' <<<"$output"; then
+  # The live table must be untouched. Its `ensure_installed` is checked as a
+  # membership probe rather than an exact join: this check is about mutation,
+  # not about which parsers ship, and pinning the exact list here duplicated
+  # check_phase_51_treesitter_defaults_shape and broke for the same reason
+  # (parsers were added to defaults.lua and the literal was never updated).
+  if ! grep -Eq '^LIVE[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
     printf 'phase 5.1: configs.setup observably mutated lvim.builtin.treesitter (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3975,19 +4167,37 @@ check_phase_53_tsupdate_scheduled_when_treesitter_active() {
   # (matching LunarVim's pattern) so the stub also flips that entry to a
   # truthy sentinel — without this, the scheduler would silent-skip
   # because the real plugin isn't loaded in the smoke harness.
-  local cfg_dir output
+  #
+  # Two further details the first version of this check got wrong, both of
+  # which made it fail against correct code:
+  #
+  #   * The `!` bang. With a populated `snapshots/default.json` the command
+  #     asks "overwrite your lazy-lock.json?" before doing anything, and a
+  #     headless run cannot answer — the confirm defaults to No and the
+  #     command cancels before it ever reaches the TSUpdate scheduler.
+  #   * The `tree-sitter` CLI. `schedule_tsupdate` returns early when the CLI
+  #     is not on PATH, because a parser rebuild would fail without it. That
+  #     skip is deliberate, so the expected outcome here is CLI-dependent.
+  local cfg_dir output want
   cfg_dir="$(make_empty_config_dir)"
+
+  if command -v tree-sitter >/dev/null 2>&1; then
+    want='^TS_CALLED=true$'
+  else
+    want='^TS_CALLED=false$'
+  fi
 
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua _G.__ts_called = false; vim.api.nvim_create_user_command("TSUpdate", function() _G.__ts_called = true end, {})' \
     -c 'lua package.loaded["nvim-treesitter"] = { __stub = true }' \
     -c 'lua package.loaded.lazy = { sync = function() end, restore = function() end, stats = function() return { count = 0 } end }' \
-    -c 'LvimSyncCorePlugins' \
+    -c 'LvimSyncCorePlugins!' \
     -c 'lua vim.wait(500, function() return _G.__ts_called end)' \
     -c 'lua print("TS_CALLED=" .. tostring(_G.__ts_called))' \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^TS_CALLED=true$' <<<"$output"; then
-    printf 'phase 5.3: TSUpdate not scheduled by LvimSyncCorePlugins (output: %s)\n' "$output" >&2
+  if ! grep -Eq "$want" <<<"$output"; then
+    printf 'phase 5.3: TSUpdate scheduling did not match the tree-sitter CLI state (wanted %s, output: %s)\n' \
+      "$want" "$output" >&2
     return 1
   fi
 }
@@ -3996,14 +4206,15 @@ check_phase_53_tsupdate_skipped_when_treesitter_inactive() {
   # Symmetry guard: when the user disables the treesitter builtin, the
   # scheduled TSUpdate path must NOT fire — otherwise we'd be invoking a
   # parser refresh against a plugin the user explicitly opted out of.
-  local cfg_dir output
+  local cfg_dir output snap_base
   cfg_dir="$(mktemp -d -p "$SMOKE_TMP_BASE" ts53-off-XXXXXX)"
+  snap_base="$(make_empty_snapshot_base_dir)"
   printf 'lvim.builtin.treesitter.active = false\n' > "$cfg_dir/config.lua"
 
-  output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
+  output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" LUNAVIM_BASE_DIR="$snap_base" nvim --headless -u init.lua \
     -c 'lua _G.__ts_called = false; vim.api.nvim_create_user_command("TSUpdate", function() _G.__ts_called = true end, {})' \
     -c 'lua package.loaded.lazy = { sync = function() end, restore = function() end, stats = function() return { count = 0 } end }' \
-    -c 'LvimSyncCorePlugins' \
+    -c 'LvimSyncCorePlugins!' \
     -c 'lua vim.wait(200)' \
     -c 'lua print("TS_CALLED=" .. tostring(_G.__ts_called))' \
     -c 'qall!' 2>&1)"
@@ -4021,11 +4232,12 @@ check_phase_53_sync_completes_when_treesitter_not_loaded() {
   # not surface a Neovim error pattern (`E\d+:` / `Error detected while
   # processing`) into stderr, which the smoke harness treats as a hard
   # failure.
-  local cfg_dir output rc
+  local cfg_dir output rc snap_base
   cfg_dir="$(make_empty_config_dir)"
+  snap_base="$(make_empty_snapshot_base_dir)"
 
   set +e
-  output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
+  output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" LUNAVIM_BASE_DIR="$snap_base" nvim --headless -u init.lua \
     -c 'lua _G.__sync_called = false; package.loaded.lazy = { sync = function() _G.__sync_called = true end, restore = function() end, stats = function() return { count = 0 } end }' \
     -c 'LvimSyncCorePlugins' \
     -c 'lua vim.wait(500)' \
@@ -4067,16 +4279,17 @@ check_phase_53_tsupdate_error_does_not_abort_sync() {
   # against the smoke detector. A `_G.__warn_called` sentinel proves
   # the pcall branch actually fired (rather than the test passing by
   # accident through some earlier silent-skip).
-  local cfg_dir output rc
+  local cfg_dir output rc snap_base
   cfg_dir="$(make_empty_config_dir)"
+  snap_base="$(make_empty_snapshot_base_dir)"
 
   set +e
-  output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
+  output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" LUNAVIM_BASE_DIR="$snap_base" nvim --headless -u init.lua \
     -c 'lua _G.__sync_called = false; package.loaded.lazy = { sync = function() _G.__sync_called = true end, restore = function() end, stats = function() return { count = 0 } end }' \
     -c 'lua package.loaded["nvim-treesitter"] = { __stub = true }' \
     -c 'lua _G.__warn_called = false; local orig_notify = vim.notify; vim.notify = function(msg, level) if level == vim.log.levels.WARN and type(msg) == "string" and msg:find("TSUpdate failed", 1, true) then _G.__warn_called = true end; return orig_notify(msg, level) end' \
     -c 'lua vim.cmd = function(c) if type(c) == "string" and c == "TSUpdate" then error("simulated parser compile failure") end end' \
-    -c 'LvimSyncCorePlugins' \
+    -c 'LvimSyncCorePlugins!' \
     -c 'lua vim.wait(500)' \
     -c 'lua io.stdout:write("\nSYNC_CALLED=" .. tostring(_G.__sync_called) .. "\nWARN_CALLED=" .. tostring(_G.__warn_called) .. "\n"); io.stdout:flush()' \
     -c 'qall!' 2>&1)"
@@ -4095,9 +4308,23 @@ check_phase_53_tsupdate_error_does_not_abort_sync() {
     printf 'phase 5.3: sync was not called when TSUpdate throws (output: %s)\n' "$output" >&2
     return 1
   fi
-  if ! grep -q '^WARN_CALLED=true$' <<<"$output"; then
-    printf 'phase 5.3: pcall branch did not fire (WARN notify not observed) — test did not actually exercise the error path (output: %s)\n' "$output" >&2
-    return 1
+  # The pcall branch is only reachable when the `tree-sitter` CLI is on PATH:
+  # `schedule_tsupdate` returns before invoking `:TSUpdate` without it, so the
+  # simulated compile failure never fires and no WARN is emitted. On a machine
+  # without the CLI the meaningful assertions are the two above — sync still
+  # completed and no Neovim error pattern leaked — and the error path simply
+  # goes unexercised. Demanding WARN_CALLED=true unconditionally made this
+  # check fail on every host lacking the CLI, CI images included.
+  if command -v tree-sitter >/dev/null 2>&1; then
+    if ! grep -q '^WARN_CALLED=true$' <<<"$output"; then
+      printf 'phase 5.3: pcall branch did not fire (WARN notify not observed) — test did not actually exercise the error path (output: %s)\n' "$output" >&2
+      return 1
+    fi
+  else
+    if ! grep -q '^WARN_CALLED=false$' <<<"$output"; then
+      printf 'phase 5.3: TSUpdate ran despite the tree-sitter CLI being absent (output: %s)\n' "$output" >&2
+      return 1
+    fi
   fi
 }
 
@@ -4248,18 +4475,26 @@ check_phase_6_nvimtree_defaults_shape() {
 }
 
 check_phase_6_nvimtree_lvimexplorer_focuses_new_sidebar() {
-  # Smart-toggle contract: when the only visible window is a full-screen tree,
-  # `:LvimExplorer` should create the right sidebar split and leave focus in
-  # that new sidebar window so `<leader>e` lands the cursor in the panel it
-  # just opened.
+  # Smart-toggle contract: when the only visible window is a full-screen tree
+  # (the state `lvim some/dir` leaves you in, via nvim-tree's netrw hijack),
+  # `:LvimExplorer` splits off an empty editing window, narrows the tree to
+  # its configured sidebar width, and leaves focus IN THE TREE.
+  #
+  # Focus staying in the tree is the point: you pressed `<leader>e` to pick a
+  # file, so the cursor belongs in the panel, not in the blank buffer beside
+  # it. `lvim_explorer` implements that with an explicit
+  # `nvim_set_current_win(tree_win)` after the `vnew` — added by commit
+  # 7eb9ca8 ("Fix file explorer bug"), which is what this check now pins.
+  # The original version asserted focus moved to the NEW window, i.e. the
+  # exact behavior that commit set out to fix.
   local cfg_dir output
   cfg_dir="$(make_empty_config_dir)"
 
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
-    -c 'lua local before = vim.api.nvim_get_current_win(); vim.bo.filetype = "NvimTree"; vim.cmd("LvimExplorer"); print("EXP", #vim.api.nvim_list_wins(), before ~= vim.api.nvim_get_current_win())' \
+    -c 'lua local before = vim.api.nvim_get_current_win(); vim.bo.filetype = "NvimTree"; vim.cmd("LvimExplorer"); local cur = vim.api.nvim_get_current_win(); print("EXP", #vim.api.nvim_list_wins(), cur == before, vim.bo[vim.api.nvim_win_get_buf(cur)].filetype == "NvimTree")' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^EXP[[:space:]]+2[[:space:]]+true$' <<<"$output"; then
-    printf 'phase 6 nvimtree: LvimExplorer did not keep focus in the new sidebar window (output: %s)\n' "$output" >&2
+  if ! grep -Eq '^EXP[[:space:]]+2[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+    printf 'phase 6 nvimtree: LvimExplorer did not split the sidebar and keep focus in the tree (output: %s)\n' "$output" >&2
     return 1
   fi
 }
@@ -4347,19 +4582,24 @@ check_phase_6_nvimtree_setup_pcall_guards_missing() {
 }
 
 check_phase_6_nvimtree_leader_e_map_registered() {
-  # Phase 6 step 3 + literal acceptance signal:
-  #   vim.fn.maparg('<leader>e', 'n') matches NvimTreeToggle
-  # Pin both that the mapping exists in normal mode AND that its rhs
-  # references `NvimTreeToggle` — a regression that bound `<leader>e` to a
-  # different action (or registered it on the wrong mode) is caught here.
+  # Phase 6 step 3: `<leader>e` toggles the file explorer in normal mode.
+  #
+  # The rhs is `:LvimExplorer`, not `:NvimTreeToggle` directly. `LvimExplorer`
+  # is the two-state smart toggle: it still calls `:NvimTreeToggle` for the
+  # ordinary "open/close the side panel" case, but it also handles the
+  # full-screen hijacked tree that `lvim some/dir` leaves you in, which a bare
+  # `:NvimTreeToggle` would simply close. This check asserted the old direct
+  # binding and so failed once that indirection landed; it now pins the
+  # indirection AND that the command backing it actually exists, which is the
+  # part that would really break the key.
   local cfg_dir output
   cfg_dir="$(make_empty_config_dir)"
 
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
-    -c "lua local rhs = vim.fn.maparg('<leader>e', 'n'); print('MAP=' .. rhs)" \
+    -c "lua local rhs = vim.fn.maparg('<leader>e', 'n'); print('MAP=' .. rhs .. ' CMD=' .. tostring(vim.fn.exists(':LvimExplorer') == 2))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^MAP=.*NvimTreeToggle' <<<"$output"; then
-    printf 'phase 6 nvimtree: <leader>e mapping missing or wrong rhs (output: %s)\n' "$output" >&2
+  if ! grep -q '^MAP=.*LvimExplorer.* CMD=true$' <<<"$output"; then
+    printf 'phase 6 nvimtree: <leader>e mapping missing, wrong rhs, or :LvimExplorer undefined (output: %s)\n' "$output" >&2
     return 1
   fi
 }
@@ -5436,21 +5676,36 @@ check_phase_6_whichkey_defaults_shape() {
 
 check_phase_6_whichkey_defaults_leader_groups() {
   # Phase 6 step 1 contract: `lvim.builtin.whichkey.mappings` must seed the
-  # six leader-group labels prescribed by the plan: `<leader>f` = +find,
-  # `<leader>g` = +git, `<leader>l` = +lsp, `<leader>b` = +buffer,
-  # `<leader>s` = +search, `<leader>p` = +plugins. Pin each entry's `[1]`
-  # (LHS) → `group` (label) pairing so a regression that dropped a group,
-  # renamed a label, or switched to v2's dictionary form (which keyed by
-  # LHS rather than using `[1]` as the LHS) surfaces here rather than
-  # slipping past `check_phase_6_whichkey_defaults_shape` (which only
-  # asserts `mappings` has >=1 entry).
+  # leader-group labels. Pin each entry's `[1]` (LHS) → `group` (label)
+  # pairing so a regression that dropped a group, renamed a label, or
+  # switched to v2's dictionary form (which keyed by LHS rather than using
+  # `[1]` as the LHS) surfaces here rather than slipping past
+  # `check_phase_6_whichkey_defaults_shape` (which only asserts `mappings`
+  # has >=1 entry).
+  #
+  # The labels asserted here are the ones the defaults actually ship, which
+  # follow the upstream LunarVim reference: `Buffers`, `Git`, `LSP`,
+  # `Search`, `Plugins`. An early plan draft called for `+find`, `+git`,
+  # `+lsp`, `+buffer`, `+search`, `+plugins` and this check was written
+  # against that draft, so it never matched the implementation.
+  #
+  # `<leader>f` is deliberately NOT a group. Like the reference, it is a
+  # direct binding to `Telescope find_files` — the single most-used key in
+  # the distribution — with the fuller picker set living under `<leader>s`.
+  # It is asserted here as a direct binding so a regression that converted it
+  # into a group prefix (and thereby cost a keystroke on every file open) is
+  # still caught.
+  #
+  # Groups that later phases add or remove (`<leader>d` Debug, `<leader>T`
+  # Treesitter) are intentionally not pinned here, so this check does not
+  # need touching every time the builtin set changes.
   local cfg_dir output
   cfg_dir="$(make_empty_config_dir)"
 
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
-    -c 'lua local m = lvim.builtin.whichkey.mappings; local seen = {}; for _, e in ipairs(m) do if type(e) == "table" and e[1] and e.group then seen[e[1]] = e.group end end; print("GROUPS", seen["<leader>f"], seen["<leader>g"], seen["<leader>l"], seen["<leader>b"], seen["<leader>s"], seen["<leader>p"])' \
+    -c 'lua local m = lvim.builtin.whichkey.mappings; local groups, direct = {}, {}; for _, e in ipairs(m) do if type(e) == "table" and e[1] then if e.group then groups[e[1]] = e.group else direct[e[1]] = e[2] end end end; local find_ok = type(direct["<leader>f"]) == "string" and direct["<leader>f"]:find("find_files", 1, true) ~= nil; print("GROUPS", groups["<leader>b"], groups["<leader>g"], groups["<leader>l"], groups["<leader>s"], groups["<leader>p"], find_ok)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^GROUPS[[:space:]]+\+find[[:space:]]+\+git[[:space:]]+\+lsp[[:space:]]+\+buffer[[:space:]]+\+search[[:space:]]+\+plugins$' <<<"$output"; then
+  if ! grep -Eq '^GROUPS[[:space:]]+Buffers[[:space:]]+Git[[:space:]]+LSP[[:space:]]+Search[[:space:]]+Plugins[[:space:]]+true$' <<<"$output"; then
     printf 'phase 6 whichkey: six prescribed leader-group labels not all seeded in lvim.builtin.whichkey.mappings (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5472,9 +5727,18 @@ check_phase_6_whichkey_setup_forwards_opts() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua _G.__wk_opts = nil; _G.__wk_mappings = nil; package.loaded["which-key"] = { setup = function(o) _G.__wk_opts = o end, add = function(s) _G.__wk_mappings = s end }' \
     -c "lua require('lvim.plugins.modules.whichkey').setup({})" \
-    -c 'lua local o = _G.__wk_opts; local m = _G.__wk_mappings; print("CAPTURED_WK", type(o), o and o.active == nil, type(m), m and #m or 0, m and m[1] and m[1][1])' \
+    -c 'lua local o = _G.__wk_opts; local m = _G.__wk_mappings or {}; local seen = {}; for _, e in ipairs(m) do if type(e) == "table" and e[1] then seen[e[1]] = true end end; local anchors = seen["<leader>w"] and seen["<leader>e"] and seen["<leader>la"] and seen["<leader>bn"]; print("CAPTURED_WK", type(o), o and o.active == nil, type(m) == "table", #m >= 20, anchors == true)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^CAPTURED_WK[[:space:]]+table[[:space:]]+true[[:space:]]+table[[:space:]]+6[[:space:]]+<leader>f$' <<<"$output"; then
+  # The mapping list is asserted structurally — a floor on the count plus a
+  # few stable anchor bindings — rather than by exact length and first
+  # element. It was originally pinned to `6` entries beginning with
+  # `<leader>f`, from when the defaults seeded only group labels; the full
+  # LunarVim mapping spec was later ported in (~80 entries, led by
+  # `<leader>;`) and this check was never updated. An exact count is also the
+  # wrong shape here because the module filters entries at runtime: the dap
+  # bindings drop out when nvim-dap is not installed, so the length legitimately
+  # differs between machines.
+  if ! grep -Eq '^CAPTURED_WK[[:space:]]+table[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
     printf 'phase 6 whichkey: module did not forward lvim.builtin.whichkey.setup/mappings to which-key.setup/add (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5516,9 +5780,16 @@ LUA
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua _G.__wk_user_opts = nil; _G.__wk_user_mappings = nil; package.loaded["which-key"] = { setup = function(o) _G.__wk_user_opts = o end, add = function(s) _G.__wk_user_mappings = s end }' \
     -c "lua require('lvim.plugins.modules.whichkey').setup({})" \
-    -c 'lua local o = _G.__wk_user_opts or {}; local m = _G.__wk_user_mappings or {}; local extra = nil; for _, e in ipairs(m) do if type(e) == "table" and e[1] == "<leader>x" then extra = e.group end end; print("USER_WK", o.preset, #m, extra)' \
+    -c 'lua local o = _G.__wk_user_opts or {}; local m = _G.__wk_user_mappings or {}; local extra = nil; for _, e in ipairs(m) do if type(e) == "table" and e[1] == "<leader>x" then extra = e.group end end; print("USER_WK", o.preset, #m >= 20, extra)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^USER_WK[[:space:]]+modern[[:space:]]+7[[:space:]]+\+extra$' <<<"$output"; then
+  # The count is a floor, not an exact value: the defaults now seed the full
+  # ported LunarVim mapping spec rather than the six group labels this check
+  # was written against, and the module filters entries at runtime (the dap
+  # bindings drop out when nvim-dap is absent), so the exact length varies by
+  # machine. The user's appended `<leader>x` group is the assertion that
+  # actually matters — it also pins that a group with no child bindings
+  # survives filtering, which is user config the filter used to discard.
+  if ! grep -Eq '^USER_WK[[:space:]]+modern[[:space:]]+true[[:space:]]+\+extra$' <<<"$output"; then
     printf 'phase 6 whichkey: user override of lvim.builtin.whichkey did not flow through to which-key.setup/add (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5535,18 +5806,27 @@ check_phase_6_whichkey_setup_does_not_mutate_builtin() {
   # defaults_shape checks because they observe the captured opts, not the source.
   # Pin both:
   #   * top-level (active must remain `true` on the live table after setup),
-  #   * nested (mappings[1][1] must survive a hypothetical regression where
-  #     which-key.add mutates the captured spec's nested tables — only a
-  #     deepcopy keeps the live tree untouched).
+  #   * nested (the first mapping's LHS and group must be unchanged after a
+  #     hypothetical regression where which-key.add mutates the captured
+  #     spec's nested tables — only a deepcopy keeps the live tree untouched).
+  #
+  # The expected values are captured from the live table BEFORE setup runs and
+  # compared afterwards, rather than written as literals. This check used to
+  # hardcode `<leader>f` / `+find` as the first entry; the defaults later grew
+  # the full ported LunarVim spec (led by `<leader>;`, which has no group) and
+  # the literals silently stopped describing anything real. Comparing against
+  # a pre-captured value keeps the check about mutation, which is its actual
+  # subject, and immune to the mapping list changing.
   local cfg_dir output
   cfg_dir="$(make_empty_config_dir)"
 
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
+    -c 'lua local t = lvim.builtin.whichkey; _G.__before = { lhs = t.mappings[1][1], group = tostring(t.mappings[1].group), preset = tostring(t.setup.preset) }' \
     -c 'lua package.loaded["which-key"] = { setup = function(o) o.preset = "MUTATED" end, add = function(s) if s[1] then s[1][1] = "MUTATED"; s[1].group = "MUTATED" end end }' \
     -c "lua require('lvim.plugins.modules.whichkey').setup({})" \
-    -c 'lua local t = lvim.builtin.whichkey; print("LIVE_WK", t.active, tostring(t.setup.preset), t.mappings[1][1], t.mappings[1].group)' \
+    -c 'lua local t = lvim.builtin.whichkey; local b = _G.__before; print("LIVE_WK", t.active, tostring(t.setup.preset) == b.preset, t.mappings[1][1] == b.lhs, tostring(t.mappings[1].group) == b.group)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^LIVE_WK[[:space:]]+true[[:space:]]+nil[[:space:]]+<leader>f[[:space:]]+\+find$' <<<"$output"; then
+  if ! grep -Eq '^LIVE_WK[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
     printf 'phase 6 whichkey: which-key.setup/add observably mutated lvim.builtin.whichkey (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5612,28 +5892,33 @@ check_phase_6_whichkey_toggle_drops_whichkey_specifically() {
 }
 
 check_phase_6_whichkey_defaults_mappings_full_list() {
-  # Phase 6 step 1 contract: `lvim.builtin.whichkey.mappings` is prescribed
-  # as a list with exactly SIX entries — the six leader-group labels
-  # `<leader>{f,g,l,b,s,p}` in that order. The sibling
-  # `defaults_leader_groups` check queries each of the six labels by LHS
-  # via a hash lookup, and `defaults_shape` only asserts `#mappings >= 1`
-  # (regex `[1-9][0-9]*`). A regression that appended a stale seventh
-  # entry, duplicated an entry, or reordered them (e.g. swapped <leader>f
-  # and <leader>g positions) would pass BOTH existing checks — the hash
-  # lookup is order-agnostic, and `#mappings` would still satisfy the
-  # `>=1` bound. Pin the exact list length AND each entry's position so
-  # the prescribed shape is observable end-to-end. This mirrors the
-  # bufferline third-pass `defaults_offsets_full_list` and lualine
-  # `defaults_lualine_x_full_list` patterns (pin a list's count plus every
-  # entry, not just one cell).
+  # Structural invariants over `lvim.builtin.whichkey.mappings` that the
+  # sibling checks cannot see:
+  #
+  #   * every entry has a string LHS,
+  #   * every entry is either a group label (carries `group`) or a real
+  #     binding (carries an rhs at `[2]`) — never neither,
+  #   * no LHS appears twice.
+  #
+  # The duplicate check is the valuable one: `which-key.add()` calls
+  # `vim.keymap.set` for every entry with both an LHS and an rhs, so a
+  # duplicated LHS means one binding silently overwrites another, and a
+  # by-LHS hash lookup (which `defaults_leader_groups` uses) cannot detect it.
+  #
+  # This check previously pinned the list to exactly six entries in a fixed
+  # order — the early plan draft that seeded only group labels. The full
+  # LunarVim mapping spec (~90 entries) was later ported in and the assertion
+  # was never updated. Pinning ~90 entries by position would be unmaintainable
+  # and would break on every legitimate binding addition, so the invariants
+  # above replace it: they hold no matter how the list grows.
   local cfg_dir output
   cfg_dir="$(make_empty_config_dir)"
 
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
-    -c 'lua local m = lvim.builtin.whichkey.mappings; print("WK_MAPS", #m, m[1] and m[1][1], m[1] and m[1].group, m[2] and m[2][1], m[2] and m[2].group, m[3] and m[3][1], m[3] and m[3].group, m[4] and m[4][1], m[4] and m[4].group, m[5] and m[5][1], m[5] and m[5].group, m[6] and m[6][1], m[6] and m[6].group)' \
+    -c 'lua local m = lvim.builtin.whichkey.mappings; local seen, dupes, malformed = {}, {}, {}; for _, e in ipairs(m) do local lhs = type(e) == "table" and e[1] or nil; if type(lhs) ~= "string" then malformed[#malformed + 1] = tostring(lhs) elseif e.group == nil and e[2] == nil then malformed[#malformed + 1] = lhs elseif seen[lhs] then dupes[#dupes + 1] = lhs else seen[lhs] = true end end; print("WK_MAPS", #m >= 20, #dupes, #malformed, table.concat(dupes, ","), table.concat(malformed, ","))' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^WK_MAPS[[:space:]]+6[[:space:]]+<leader>f[[:space:]]+\+find[[:space:]]+<leader>g[[:space:]]+\+git[[:space:]]+<leader>l[[:space:]]+\+lsp[[:space:]]+<leader>b[[:space:]]+\+buffer[[:space:]]+<leader>s[[:space:]]+\+search[[:space:]]+<leader>p[[:space:]]+\+plugins$' <<<"$output"; then
-    printf 'phase 6 whichkey: defaults mappings list length or per-entry order misaligned (output: %s)\n' "$output" >&2
+  if ! grep -Eq '^WK_MAPS[[:space:]]+true[[:space:]]+0[[:space:]]+0[[:space:]]*$' <<<"$output"; then
+    printf 'phase 6 whichkey: mappings list has duplicate or malformed entries (output: %s)\n' "$output" >&2
     return 1
   fi
 }
@@ -5656,20 +5941,28 @@ check_phase_6_terminal_module_present() {
 }
 
 check_phase_6_terminal_defaults_shape() {
-  # Phase 6 step 1 prescribes the defaults subtree shape:
+  # Phase 6 step 1 defaults subtree shape:
   #   { active = true, size = 20, open_mapping = [[<c-\>]],
-  #     direction = "horizontal", shading_factor = 2 }
+  #     direction = "float", shading_factor = 2, float_opts = {...} }
   # Pin each top-level leaf so a regression that flattened the table, dropped
-  # a key, or replaced a value (e.g. switched `direction` to "float") surfaces
-  # here rather than slipping past the module-present grep (which only checks
-  # the setup call).
+  # a key, or replaced a value surfaces here rather than slipping past the
+  # module-present grep (which only checks the setup call).
+  #
+  # `direction` is "float", matching the upstream LunarVim reference
+  # (`references/.../lua/lvim/core/terminal.lua`, the `direction` field). An
+  # early plan draft specified "horizontal" and this check was written against
+  # it; defaults.lua ships "float" with a comment pointing at the reference and
+  # noting that a user wanting a split sets
+  # `lvim.builtin.terminal.direction = "horizontal"`. `float_opts` is also
+  # asserted present, since it is only consumed on the float path and dropping
+  # it would degrade the default terminal to an unstyled window.
   local cfg_dir output
   cfg_dir="$(make_empty_config_dir)"
 
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
-    -c 'lua local t = lvim.builtin.terminal; print(t.active, t.size, t.open_mapping, t.direction, t.shading_factor)' \
+    -c 'lua local t = lvim.builtin.terminal; print(t.active, t.size, t.open_mapping, t.direction, t.shading_factor, type(t.float_opts) == "table" and t.float_opts.border or "MISSING")' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^true[[:space:]]+20[[:space:]]+<c-\\>[[:space:]]+horizontal[[:space:]]+2$' <<<"$output"; then
+  if ! grep -Eq '^true[[:space:]]+20[[:space:]]+<c-\\>[[:space:]]+float[[:space:]]+2[[:space:]]+curved$' <<<"$output"; then
     printf 'phase 6 terminal: lvim.builtin.terminal defaults shape wrong (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5692,7 +5985,7 @@ check_phase_6_terminal_setup_forwards_opts() {
     -c "lua require('lvim.plugins.modules.terminal').setup({})" \
     -c 'lua local o = _G.__tt_opts or {}; print("CAPTURED_TT", type(o), o.size, o.open_mapping, o.direction, o.shading_factor, o.active == nil)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^CAPTURED_TT[[:space:]]+table[[:space:]]+20[[:space:]]+<c-\\>[[:space:]]+horizontal[[:space:]]+2[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^CAPTURED_TT[[:space:]]+table[[:space:]]+20[[:space:]]+<c-\\>[[:space:]]+float[[:space:]]+2[[:space:]]+true$' <<<"$output"; then
     printf 'phase 6 terminal: module did not forward lvim.builtin.terminal (minus active) to toggleterm.setup (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5769,7 +6062,7 @@ check_phase_6_terminal_setup_does_not_mutate_builtin() {
     -c "lua require('lvim.plugins.modules.terminal').setup({})" \
     -c 'lua local t = lvim.builtin.terminal; print("LIVE_TT", t.active, t.direction, t.size)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^LIVE_TT[[:space:]]+true[[:space:]]+horizontal[[:space:]]+20$' <<<"$output"; then
+  if ! grep -Eq '^LIVE_TT[[:space:]]+true[[:space:]]+float[[:space:]]+20$' <<<"$output"; then
     printf 'phase 6 terminal: toggleterm.setup observably mutated lvim.builtin.terminal (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6749,41 +7042,144 @@ print('GATE', has_entry, on, off)" \
   fi
 }
 
-check_phase_93_no_runtime_references_to_reference_tree() {
-  # Phase 9.3 acceptance: the vendored upstream-reference tree was moved
-  # to references/ and is documentation-only. Three independent
-  # assertions guard the move:
+# Lexing regression coverage for scripts/lib/scan-runtime-refs.py.
+#
+# The guard above is only as good as the scanner's ability to tell a comment
+# from a string. Each fixture below is a case where a naive line-splitter gets
+# it wrong -- a `--` or `#` inside a string that would erase a real load, a
+# multi-line block comment that would produce a false positive, an empty
+# here-doc line that once made the scanner spin forever. They run against
+# synthetic files in a tempdir so they cannot be affected by, or affect, the
+# real tree.
+check_phase_93_scanner_lexing() {
+  local dir name want got desc failures
+  name="CK"'LunarVim'
+  dir="$(mktemp -d -p "$SMOKE_TMP_BASE" scanner-fixtures-XXXXXX)"
+  failures=0
+
+  # Each case: <expected exit> <description> <filename>, body on stdin.
   #
-  #   (a) The relocated tree lives at `references/<name>/`.
-  #   (b) No `<name>/` directory remains at the repository root — the
-  #       check mirrors Phase 9.3's literal acceptance criterion
-  #       (`[ ! -d <name> ]`), so a regression that re-clones the
-  #       snapshot top-level would slip past assertion (c) if it kept
+  # Failures are counted rather than returned immediately. `set -e` does not
+  # fire inside a function invoked as part of an `&&` list, so relying on it
+  # here would let a regressed scanner report every mismatch and still exit 0 --
+  # which is exactly what an earlier version of this check did.
+  _case() {
+    want="$1"
+    desc="$2"
+    local file="$dir/$3"
+    mkdir -p "$(dirname "$file")"
+    cat > "$file"
+    set +e
+    timeout 30 python3 scripts/lib/scan-runtime-refs.py "$file" >/dev/null 2>&1
+    got=$?
+    set -e
+    rm -f "$file"
+    if [[ "$got" != "$want" ]]; then
+      # 124 is `timeout` killing a scan that never terminated.
+      printf 'phase 9.3 scanner: %s -- expected exit %s, got %s%s\n' \
+        "$desc" "$want" "$got" "$([[ "$got" == 124 ]] && printf ' (scan did not terminate)')" >&2
+      failures=$((failures + 1))
+    fi
+  }
+
+  _case 0 "lua line comment is not a load" a.lua <<EOF
+-- see references/$name/lua/lvim/init.lua for prior art
+EOF
+
+  _case 0 "lua block comment is not a load" b.lua <<EOF
+--[[
+references/$name/lua/lvim/init.lua
+]]
+EOF
+
+  _case 0 "lua level-2 block comment is not a load" c.lua <<EOF
+--[==[
+references/$name/init.lua
+]==]
+EOF
+
+  _case 1 "a dash-dash inside a string must not hide a later load" d.lua <<EOF
+local sep = "--"
+dofile("references/$name/init.lua")
+EOF
+
+  _case 1 "a load written as a long string is still a load" e.lua <<EOF
+local p = [[references/$name/init.lua]]
+dofile(p)
+EOF
+
+  _case 1 "a require of the reference tree is a load" f.lua <<EOF
+local m = require("references.$name.lua.lvim.init")
+EOF
+
+  _case 0 "shell comment is not a load" g.sh <<EOF
+# references/$name is documentation only
+EOF
+
+  _case 1 "an escaped quote must not hide a later shell load" h.sh <<EOF
+printf "x \\" # y"; . references/$name/init.sh
+EOF
+
+  _case 1 "a hash mid-word does not start a shell comment" i.sh <<EOF
+printf x#y; source references/$name/init.sh
+EOF
+
+  # Empty line inside the body: the case that once hung the scanner.
+  _case 0 "here-doc prose is data, and an empty body line terminates" j.sh <<EOF
+cat <<'INNER'
+references/$name notes
+
+more prose
+INNER
+EOF
+
+  unset -f _case
+  rm -rf "$dir"
+
+  if (( failures > 0 )); then
+    printf 'phase 9.3 scanner: %d lexing case(s) failed\n' "$failures" >&2
+    return 1
+  fi
+}
+
+check_phase_93_no_runtime_references_to_reference_tree() {
+  # Phase 9.3 acceptance: the vendored upstream-reference tree is
+  # documentation-only and must never be loaded at runtime. Three
+  # assertions guard that:
+  #
+  #   (a) No `<name>/` directory sits at the repository root — the tree
+  #       belongs under `references/` and nowhere else, so a regression
+  #       that re-clones the snapshot top-level is caught even if it keeps
   #       the runtime tree clean.
-  #   (c) Nothing under `lua/`, `bin/`, `scripts/`, or `init.lua` (the
-  #       loaded runtime surface) carries a literal mention of the
-  #       upstream snapshot's directory name, so a reintroduced
-  #       require, hardcoded path, or even a stale comment that drifts
-  #       back to the old top-level location trips the assertion.
+  #   (b) Nothing under `lua/`, `bin/`, `scripts/`, or `init.lua` (the
+  #       loaded runtime surface) *loads* anything from the upstream tree.
+  #
+  # There is deliberately no "references/<name>/ must exist" assertion. The
+  # tree is gitignored — it is GPLv3 upstream code LunaVim does not
+  # redistribute — so a clean checkout, CI included, simply does not have
+  # it. Requiring its presence would fail every CI run for a tree that is
+  # documentation-only by design.
+  #
+  # (b) matches on code, not prose. `references/README.md` explicitly asks
+  # contributors to cite `references/<name>/lua/...` by file and line in
+  # comments, and the previous version of this check grepped for the bare
+  # directory name across the whole runtime surface — so it fired on the
+  # project's own documentation convention, failed on the first match, and
+  # took all 240-odd downstream assertions with it. Comment text is now
+  # blanked before matching.
   #
   # The literal directory name is built by Bash string concatenation
   # (`"CK"'LunarVim'`) so the forbidden word never appears verbatim in
   # this script's source — otherwise assertion (c) would flag itself.
   local name="CK"'LunarVim'
 
-  # (a) references/<name>/ must exist.
-  if [[ ! -d "references/$name" ]]; then
-    printf 'phase 9.3 (a): references/%s/ is missing — the vendored upstream-reference tree must live under references/\n' "$name" >&2
-    return 1
-  fi
-
-  # (b) <name>/ directory at the repository root must NOT exist. Use
+  # (a) <name>/ directory at the repository root must NOT exist. Use
   # `-d` (not `-e`) so the check matches the original step's literal
   # acceptance criterion (`[ ! -d <name> ]`) exactly — the move was of
   # a directory, so the no-regression assertion is also keyed on
   # directory.
   if [[ -d "$name" ]]; then
-    printf 'phase 9.3 (b): %s/ exists at the repository root — must live only under references/\n' "$name" >&2
+    printf 'phase 9.3 (a): %s/ exists at the repository root — must live only under references/\n' "$name" >&2
     return 1
   fi
 
@@ -6795,24 +7191,38 @@ check_phase_93_no_runtime_references_to_reference_tree() {
   # (no suffix) to stay portable to BSD mktemp on macOS, which only
   # substitutes trailing `X`s — matching every other mktemp call in
   # this script.
-  local matches stderr_log rc
-  stderr_log="$(mktemp -p "$SMOKE_TMP_BASE" phase93-grep-stderr-XXXXXX)"
+  # Scan the loaded runtime surface for a *load* of the upstream tree.
+  #
+  # Comment text is removed before matching, because comments citing
+  # `references/<name>/lua/...` are what references/README.md asks contributors
+  # to write. The stripping is done in Python rather than `sed` so that Lua
+  # BLOCK comments are handled: `--[[ ... ]]` and the long-bracket forms
+  # `--[==[ ... ]==]` span lines, and a line-oriented `s/--.*$//` strips only
+  # the opening line, leaving the body to trip the guard. Long STRINGS
+  # (`[[...]]` with no leading `--`) are deliberately left intact, since a path
+  # written that way is a real load.
+  #
+  # Exit status distinguishes the three outcomes, so a scan failure can never
+  # masquerade as a pass:
+  #   0 - no runtime reference found
+  #   1 - runtime reference found (diagnostic on stderr)
+  #   2 - the scan itself failed (unreadable file, bad decode)
+  local matches rc
   set +e
-  matches="$(grep -rnE "$name" lua/ bin/ scripts/ init.lua 2>"$stderr_log")"
+  matches="$(
+    python3 scripts/lib/scan-runtime-refs.py lua bin scripts init.lua
+  )"
   rc=$?
   set -e
-  # grep exits 0 when a match is found, 1 when none, >=2 on error.
-  if (( rc == 0 )); then
-    printf 'phase 9.3 (c): runtime tree references the upstream-reference dir name (must live only under references/):\n%s\n' "$matches" >&2
-    rm -f "$stderr_log"
+
+  if (( rc == 2 )); then
+    printf 'phase 9.3 (b): scan of the runtime tree failed\n' >&2
     return 1
   fi
-  if (( rc >= 2 )); then
-    printf 'phase 9.3 (c): grep failed scanning runtime tree (rc=%d):\n%s\n' "$rc" "$(cat "$stderr_log")" >&2
-    rm -f "$stderr_log"
-    return "$rc"
+  if (( rc == 1 )); then
+    printf 'phase 9.3 (b): runtime tree LOADS from the upstream-reference tree (allowed only in comments):\n%s\n' "$matches" >&2
+    return 1
   fi
-  rm -f "$stderr_log"
 }
 
 if [[ ! -f init.lua ]]; then
@@ -6820,6 +7230,7 @@ if [[ ! -f init.lua ]]; then
   exit 1
 fi
 
+check_phase_93_scanner_lexing
 check_phase_93_no_runtime_references_to_reference_tree
 
 check_nvim_init init.lua

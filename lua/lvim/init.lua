@@ -90,6 +90,14 @@ function M.start()
   -- so it lives as its own idempotent (clear-on-each-call) call.
   require("lvim.lsp.format").setup()
 
+  -- Apply any `lvim.lsp.null-ls.linters` registrations the user made from
+  -- config.lua. That call happens at `load_user_config()` time, before
+  -- lazy.nvim exists, so the shim can only record it; this is the pass that
+  -- resolves `require("lint")` through lazy's loader and installs
+  -- `linters_by_ft` plus the lint autocmd. No-op (and does not load the
+  -- plugin) when nothing was registered.
+  require("lvim.plugins.modules.lint").setup({})
+
   -- Register :LvimInfo/:LvimUpdate/:LvimSyncCorePlugins/:LvimReload/
   -- :LvimCacheReset AFTER plugin load so :LvimInfo reads an accurate plugin
   -- count from `lazy.stats()` and :LvimSyncCorePlugins can resolve `lazy`
