@@ -1,6 +1,61 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Drop error blocks that are only lazy.nvim reporting an uninstalled plugin.
+#
+# With `install.missing = false` the smoke harness deliberately runs without
+# plugins on disk. Neovim 0.12 surfaces lazy's complaint as a plain notice;
+# Neovim 0.11 raises it as a real `Error detected while processing ...
+# Autocommands` block. Same condition, same correct behavior, different
+# severity -- so a check that greps for `Error detected` passes on one version
+# and fails on the other.
+#
+# The filter removes an error header ONLY when the line that follows it is a
+# "Plugin X is not installed" line, so a genuine Lua error occurring in the
+# same run is still reported.
+strip_missing_plugin_errors() {
+  awk '
+    # A line carrying a Vim error code is NEVER dropped, whatever its text, so
+    # a genuine `error("Plugin fake is not installed")` still surfaces as
+    # `E5108: ... Plugin fake is not installed`.
+    # Match lazy.nvim s exact wording: a plugin NAME is a single token, so
+    # `Plugin gitsigns is not installed` matches while a prose message such as
+    # `Plugin foo bar is not installed` does not. Combined with never dropping
+    # an E-coded line, this keeps the suppression to lazy s own output.
+    function is_missing(line) {
+      return (line ~ /Plugin [A-Za-z0-9._-]+ is not installed/) && (line !~ /^E[0-9]+:/)
+    }
+
+    /^E[0-9]+:/ { print; next }
+
+    # lazy.nvim reports a missing plugin either as a bare notice line, or --
+    # on Neovim 0.11 -- folded into an error line such as
+    #   Error executing lua callback: ...: Vim(append):Plugin lazydev is not installed
+    # so the phrase has to be matched anywhere in the line, not just anchored.
+    is_missing($0) { suppressing = 1; next }
+
+    /Error detected while processing|Error executing lua callback/ {
+      header = $0
+      if ((getline nextline) > 0) {
+        if (is_missing(nextline)) { suppressing = 1; next }
+        print header
+        print nextline
+        suppressing = 0
+        next
+      }
+      print header
+      next
+    }
+
+    # Tails of a suppressed block: lazy.nvim s follow-up, and the Lua traceback
+    # Neovim prints under a suppressed callback error.
+    suppressing && /^Command .* not found after loading/ { next }
+    suppressing && (/^stack traceback:/ || /^\t/ || /^[[:space:]]*\[C\]:/) { next }
+
+    { suppressing = 0; print }
+  '
+}
+
 check_nvim_init() {
   local init_file="$1"
   local output
@@ -17,7 +72,11 @@ check_nvim_init() {
   rc=$?
   set -e
 
-  if (( rc != 0 )) || grep -Eq 'E[0-9]+:|Error detected while processing' <<<"$output"; then
+  # `Error executing lua callback` is included: on Neovim 0.11 a failing
+  # autocmd surfaces that way rather than as a numbered error, so omitting it
+  # let a genuine callback failure pass this check.
+  if (( rc != 0 )) || grep -Eq 'E[0-9]+:|Error detected while processing|Error executing lua callback' \
+    <<<"$(strip_missing_plugin_errors <<<"${output//$'\r'/}")"; then
     printf '%s\n' "$output" >&2
     if (( rc != 0 )); then
       return "$rc"
@@ -31,6 +90,16 @@ check_nvim_init() {
 # bash array, the subshell appends would not persist into the parent (so the
 # trap would see an empty array and leak the tempdirs). Removing one parent
 # dir cleans them all and survives that subshell boundary.
+# Every `grep ... <<<"$var"` below strips carriage returns from the captured
+# value first (`${var//$'\r'/}`).
+#
+# Neovim's headless `print()` terminates lines with CRLF on 0.11 and with LF on
+# 0.12, so a line-anchored pattern like `^GLOBALS_OK$` matches on one and fails
+# on the other against identical, correct behavior. That difference is why the
+# `test (nvim v0.11.0)` CI job failed on assertions the `stable` job passed.
+# Normalising at the point of comparison keeps the assertions readable and
+# version-independent.
+
 SMOKE_TMP_BASE="$(mktemp -d -t lvim-smoke-XXXXXX)"
 
 cleanup_smoke_tmp() {
@@ -131,7 +200,8 @@ check_lvim_appname() {
   cfg_dir="$(make_empty_config_dir)"
 
   output="$(NVIM_APPNAME=nvim LUNAVIM_CONFIG_DIR="$cfg_dir" bin/lvim --headless -c 'lua print(vim.env.NVIM_APPNAME or "")' -c 'qall!' 2>&1)"
-  if [[ "$output" != "lvim" ]]; then
+  # CR-stripped: Neovim 0.11 terminates headless print() lines with CRLF.
+  if [[ "${output//$'\r'/}" != "lvim" ]]; then
     printf 'bin/lvim did not isolate NVIM_APPNAME as lvim: %s\n' "$output" >&2
     return 1
   fi
@@ -144,7 +214,8 @@ check_lvim_launcher_uses_repo_init() {
   cfg_dir="$(make_empty_config_dir)"
 
   output="$(LUNAVIM_BASE_DIR=/tmp/lunavim-missing-base LUNAVIM_CONFIG_DIR="$cfg_dir" bin/lvim --headless -c 'lua print(vim.g.lunavim_loaded == true)' -c 'qall!' 2>&1)"
-  if [[ "$output" != "true" ]]; then
+  # CR-stripped: Neovim 0.11 terminates headless print() lines with CRLF.
+  if [[ "${output//$'\r'/}" != "true" ]]; then
     printf 'bin/lvim did not launch through the repository init.lua: %s\n' "$output" >&2
     return 1
   fi
@@ -160,14 +231,14 @@ check_user_config_applied() {
   # shellcheck disable=SC1003  # literal backslashes are exactly what we grep
   # for -- the fixture sets a backslash leader, which reaches this comparison
   # as two literal backslash characters.
-  if ! grep -F '\\' <<<"$output_leader" >/dev/null; then
+  if ! grep -F '\\' <<<"${output_leader//$'\r'/}" >/dev/null; then
     printf 'user config did not set lvim.leader (output: %s)\n' "$output_leader" >&2
     return 1
   fi
 
   output_telescope="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua print(lvim.builtin.telescope.active)' -c 'qall!' 2>&1)"
-  if ! grep -q '^false$' <<<"$output_telescope"; then
+  if ! grep -q '^false$' <<<"${output_telescope//$'\r'/}"; then
     printf 'user config did not set lvim.builtin.telescope.active=false (output: %s)\n' \
       "$output_telescope" >&2
     return 1
@@ -186,7 +257,7 @@ check_user_config_literal_acceptance() {
   # shellcheck disable=SC1003  # literal backslashes are exactly what we grep
   # for -- the fixture sets a backslash leader, which reaches this comparison
   # as two literal backslash characters.
-  if ! grep -F '\\' <<<"$output_leader" >/dev/null; then
+  if ! grep -F '\\' <<<"${output_leader//$'\r'/}" >/dev/null; then
     printf 'literal acceptance: lvim.leader not set via tests/fixtures (output: %s)\n' \
       "$output_leader" >&2
     return 1
@@ -194,7 +265,7 @@ check_user_config_literal_acceptance() {
 
   output_telescope="$(LUNAVIM_CONFIG_DIR="$repo_dir/tests/fixtures" nvim --headless -u init.lua \
     -c 'lua print(lvim.builtin.telescope.active)' -c 'qall!' 2>&1)"
-  if ! grep -q false <<<"$output_telescope"; then
+  if ! grep -q false <<<"${output_telescope//$'\r'/}"; then
     printf 'literal acceptance: telescope.active not false via tests/fixtures (output: %s)\n' \
       "$output_telescope" >&2
     return 1
@@ -218,7 +289,7 @@ check_builtin_deep_merge_semantics() {
   output="$(LUNAVIM_CONFIG_DIR="$repo_dir/tests/fixtures" nvim --headless -u init.lua \
     -c 'lua print(lvim.builtin.nvimtree.active, lvim.builtin.telescope.active)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^true[[:space:]]+false$' <<<"$output"; then
+  if ! grep -Eq '^true[[:space:]]+false$' <<<"${output//$'\r'/}"; then
     printf 'deep-merge semantics: expected "true<sp>false" from nvimtree/telescope (output: %s)\n' \
       "$output" >&2
     return 1
@@ -227,7 +298,7 @@ check_builtin_deep_merge_semantics() {
   output="$(LUNAVIM_CONFIG_DIR="$repo_dir/tests/fixtures" nvim --headless -u init.lua \
     -c 'lua print(lvim.builtin.telescope.defaults.custom)' \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^1$' <<<"$output"; then
+  if ! grep -q '^1$' <<<"${output//$'\r'/}"; then
     printf 'deep-merge semantics: telescope.defaults.custom != 1 (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -262,7 +333,7 @@ check_merge_builtin_overrides_api() {
     -c 'lua lvim.utils.merge_builtin_overrides({ my_custom_module = { active = true, opts = { extra = "yes" } } })' \
     -c 'lua local t = lvim.builtin.telescope; local m = lvim.builtin.my_custom_module; local same = _G.__cached_builtin == lvim.builtin; print(lvim.builtin.nvimtree.active, t.active, t.defaults.custom, t.defaults.sentinel, same, m.active, m.opts.extra)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^true[[:space:]]+false[[:space:]]+7[[:space:]]+keep[[:space:]]+true[[:space:]]+true[[:space:]]+yes$' <<<"$output"; then
+  if ! grep -Eq '^true[[:space:]]+false[[:space:]]+7[[:space:]]+keep[[:space:]]+true[[:space:]]+true[[:space:]]+yes$' <<<"${output//$'\r'/}"; then
     printf 'merge_builtin_overrides API: expected "true<sp>false<sp>7<sp>keep<sp>true<sp>true<sp>yes" (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -281,7 +352,7 @@ check_merge_builtin_overrides_type_guards() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua local ok, err = pcall(lvim.utils.merge_builtin_overrides, "not a table"); print(ok, type(err) == "string" and err:find("overrides must be a table", 1, true) ~= nil)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^false[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^false[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'merge_builtin_overrides type guard: expected "false<sp>true" (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -302,11 +373,11 @@ check_deep_extend_force_keep_user_helper() {
     -c 'lua local d = { a = 1, nested = { keep = "yes", overwrite = "old" } }; local u = { nested = { overwrite = "new" }, added = true }; local r = lvim.utils.deep_extend_force_keep_user(d, u); print(r.a, r.nested.keep, r.nested.overwrite, r.added)' \
     -c 'lua local empty = lvim.utils.deep_extend_force_keep_user(nil, nil); print(type(empty), next(empty) == nil)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '1[[:space:]]+yes[[:space:]]+new[[:space:]]+true' <<<"$output"; then
+  if ! grep -Eq '1[[:space:]]+yes[[:space:]]+new[[:space:]]+true' <<<"${output//$'\r'/}"; then
     printf 'deep_extend_force_keep_user: expected "1<sp>yes<sp>new<sp>true" (output: %s)\n' "$output" >&2
     return 1
   fi
-  if ! grep -Eq 'table[[:space:]]+true' <<<"$output"; then
+  if ! grep -Eq 'table[[:space:]]+true' <<<"${output//$'\r'/}"; then
     printf 'deep_extend_force_keep_user: expected nil args to yield empty table (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -340,7 +411,7 @@ check_missing_config_hint() {
     return 1
   fi
 
-  if ! grep -F 'No user config at' <<<"$stderr_out" >/dev/null; then
+  if ! grep -F 'No user config at' <<<"${stderr_out//$'\r'/}" >/dev/null; then
     printf 'missing-config hint not emitted on stderr (stdout: %s, stderr: %s)\n' \
       "$stdout_out" "$stderr_out" >&2
     return 1
@@ -360,7 +431,7 @@ check_user_plugins_appended() {
   output="$(LUNAVIM_CONFIG_DIR="$repo_dir/tests/fixtures" nvim --headless -u init.lua \
     -c "lua local s = require('lvim.plugins').final_spec(); for _,p in ipairs(s) do if (p[1] or p.url) == 'foo/bar' then print('USERPLUGIN_OK') end end" \
     -c 'qall!' 2>&1)"
-  if ! grep -q USERPLUGIN_OK <<<"$output"; then
+  if ! grep -q USERPLUGIN_OK <<<"${output//$'\r'/}"; then
     printf 'user plugin not appended to lvim.plugins.final_spec() (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -382,7 +453,7 @@ check_final_spec_filters_disabled_builtin() {
     -c 'lua lvim.builtin.telescope.active = false' \
     -c "lua local s = require('lvim.plugins').final_spec(); local has_keep, has_drop = false, false; for _,p in ipairs(s) do if p.name == 'keep' then has_keep = true end if p.name == 'telescope' then has_drop = true end end; print(has_keep, has_drop)" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^true[[:space:]]+false$' <<<"$output"; then
+  if ! grep -Eq '^true[[:space:]]+false$' <<<"${output//$'\r'/}"; then
     printf 'final_spec did not filter disabled builtin (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -408,7 +479,7 @@ check_disabled_builtin_filter_is_core_only() {
     -c "lua lvim.plugins = { { 'user/telescope', name = 'telescope' } }" \
     -c "lua local s = require('lvim.plugins').final_spec(); local repos = {}; for _,p in ipairs(s) do table.insert(repos, p[1]) end; print('REPOS=' .. table.concat(repos, ','))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^REPOS=user/telescope$' <<<"$output"; then
+  if ! grep -q '^REPOS=user/telescope$' <<<"${output//$'\r'/}"; then
     printf 'disabled-builtin filter affected user_plugins or kept core (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -428,7 +499,7 @@ check_final_spec_order_core_before_user() {
     -c "lua lvim.plugins = { { 'org/user1', name = 'user1' }, { 'org/user2', name = 'user2' } }" \
     -c "lua local s = require('lvim.plugins').final_spec(); local names = {}; for _,p in ipairs(s) do table.insert(names, p.name) end; print('ORDER=' .. table.concat(names, ','))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^ORDER=core1,core2,user1,user2$' <<<"$output"; then
+  if ! grep -q '^ORDER=core1,core2,user1,user2$' <<<"${output//$'\r'/}"; then
     printf 'final_spec did not preserve append-after-core order (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -456,7 +527,7 @@ check_anonymous_core_entry_passes_through() {
     -c 'lua lvim.builtin.telescope.active = false' \
     -c "lua local s = require('lvim.plugins').final_spec(); local repos = {}; for _,p in ipairs(s) do table.insert(repos, p[1]) end; print('REPOS=' .. table.concat(repos, ','))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^REPOS=org/anon,org/keep$' <<<"$output"; then
+  if ! grep -q '^REPOS=org/anon,org/keep$' <<<"${output//$'\r'/}"; then
     printf 'anonymous core entry did not pass through unfiltered (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -486,7 +557,7 @@ check_multiple_disabled_builtins_all_filtered() {
     -c 'lua lvim.builtin.nvimtree.active = false' \
     -c "lua local s = require('lvim.plugins').final_spec(); local repos = {}; for _,p in ipairs(s) do table.insert(repos, p[1]) end; print('REPOS=' .. table.concat(repos, ','))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^REPOS=org/keep1,org/keep2$' <<<"$output"; then
+  if ! grep -q '^REPOS=org/keep1,org/keep2$' <<<"${output//$'\r'/}"; then
     printf 'multiple disabled builtins were not all filtered (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -511,21 +582,21 @@ check_reload_globals() {
 
   out1="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua local m = require_safe('lvim.bootstrap'); print(type(m))" -c 'qall!' 2>&1)"
-  if ! grep -q '^table$' <<<"$out1"; then
+  if ! grep -q '^table$' <<<"${out1//$'\r'/}"; then
     printf 'require_safe(lvim.bootstrap) did not print "table" (output: %s)\n' "$out1" >&2
     return 1
   fi
 
   out2="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua local m = require_safe('nonexistent.module'); print(m == nil)" -c 'qall!' 2>&1)"
-  if ! grep -q '^true$' <<<"$out2"; then
+  if ! grep -q '^true$' <<<"${out2//$'\r'/}"; then
     printf 'require_safe(nonexistent.module) did not print "true" (output: %s)\n' "$out2" >&2
     return 1
   fi
 
   out3="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua reload('lvim.config'); print('RELOAD_OK')" -c 'qall!' 2>&1)"
-  if ! grep -q '^RELOAD_OK$' <<<"$out3"; then
+  if ! grep -q '^RELOAD_OK$' <<<"${out3//$'\r'/}"; then
     printf 'reload(lvim.config) did not print "RELOAD_OK" (output: %s)\n' "$out3" >&2
     return 1
   fi
@@ -533,7 +604,7 @@ check_reload_globals() {
   out4="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua package.loaded["lvim.utils.reload"] = "SENTINEL"; local m = require_clean("lvim.utils.reload"); print("CLEAN_ALIAS", type(m) == "table" and m ~= "SENTINEL", reload == require_clean)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^CLEAN_ALIAS[[:space:]]+true[[:space:]]+true$' <<<"$out4"; then
+  if ! grep -Eq '^CLEAN_ALIAS[[:space:]]+true[[:space:]]+true$' <<<"${out4//$'\r'/}"; then
     printf 'require_clean did not evict cached sentinel, or reload != require_clean (output: %s)\n' "$out4" >&2
     return 1
   fi
@@ -576,8 +647,8 @@ LUA
   set -e
 
   if (( rc != 0 )) \
-    || ! grep -q '^GLOBALS_OK$' <<<"$output" \
-    || grep -Eq '^GLOBALS_BAD$|^MISSING ' <<<"$output"; then
+    || ! grep -q '^GLOBALS_OK$' <<<"${output//$'\r'/}" \
+    || grep -Eq '^GLOBALS_BAD$|^MISSING ' <<<"${output//$'\r'/}"; then
     printf 'bootstrap globals assertion failed (rc=%d):\n%s\n' "$rc" "$output" >&2
     return 1
   fi
@@ -639,7 +710,7 @@ check_lazy_bootstrap_idempotent() {
 
   out_stats="$(LUNAVIM_RUNTIME_DIR="$rt" LUNAVIM_CONFIG_DIR="$cfg_dir" \
     nvim --headless -u init.lua -c "lua print(type(require('lazy').stats))" -c 'qall!' 2>&1)"
-  if ! grep -Eq 'function|table' <<<"$out_stats"; then
+  if ! grep -Eq 'function|table' <<<"${out_stats//$'\r'/}"; then
     printf 'require("lazy").stats not function/table after bootstrap (output: %s)\n' \
       "$out_stats" >&2
     return 1
@@ -669,7 +740,7 @@ check_phase_22_plugin_count() {
   baseline_out="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua print('PLUGINS=' .. #require('lazy').plugins())" \
     -c 'qall!' 2>&1)"
-  baseline_n="$(grep -Eo 'PLUGINS=[0-9]+' <<<"$baseline_out" | head -1 | cut -d= -f2)"
+  baseline_n="$(grep -Eo 'PLUGINS=[0-9]+' <<<"${baseline_out//$'\r'/}" | head -1 | cut -d= -f2)"
   if [[ -z "$baseline_n" ]]; then
     printf 'could not read PLUGINS= count from baseline (output: %s)\n' "$baseline_out" >&2
     return 1
@@ -683,7 +754,7 @@ check_phase_22_plugin_count() {
   match_out="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua print('STATS=' .. require('lazy').stats().count)" \
     -c 'qall!' 2>&1)"
-  stats_n="$(grep -Eo 'STATS=[0-9]+' <<<"$match_out" | head -1 | cut -d= -f2)"
+  stats_n="$(grep -Eo 'STATS=[0-9]+' <<<"${match_out//$'\r'/}" | head -1 | cut -d= -f2)"
   if [[ -z "$stats_n" ]]; then
     printf 'could not read STATS= count (output: %s)\n' "$match_out" >&2
     return 1
@@ -699,7 +770,7 @@ check_phase_22_plugin_count() {
   toggled_out="$(LUNAVIM_CONFIG_DIR="$toggle_cfg" nvim --headless -u init.lua \
     -c "lua print('PLUGINS=' .. #require('lazy').plugins())" \
     -c 'qall!' 2>&1)"
-  toggled_n="$(grep -Eo 'PLUGINS=[0-9]+' <<<"$toggled_out" | head -1 | cut -d= -f2)"
+  toggled_n="$(grep -Eo 'PLUGINS=[0-9]+' <<<"${toggled_out//$'\r'/}" | head -1 | cut -d= -f2)"
   if [[ -z "$toggled_n" ]]; then
     printf 'could not read PLUGINS= count from toggled run (output: %s)\n' "$toggled_out" >&2
     return 1
@@ -723,7 +794,7 @@ check_phase_22_plugin_count() {
   mason_off_out="$(LUNAVIM_CONFIG_DIR="$mason_off_cfg" nvim --headless -u init.lua \
     -c "lua print('PLUGINS=' .. #require('lazy').plugins())" \
     -c 'qall!' 2>&1)"
-  mason_off_n="$(grep -Eo 'PLUGINS=[0-9]+' <<<"$mason_off_out" | head -1 | cut -d= -f2)"
+  mason_off_n="$(grep -Eo 'PLUGINS=[0-9]+' <<<"${mason_off_out//$'\r'/}" | head -1 | cut -d= -f2)"
   if [[ -z "$mason_off_n" ]]; then
     printf 'could not read PLUGINS= count from mason-off run (output: %s)\n' "$mason_off_out" >&2
     return 1
@@ -750,7 +821,7 @@ check_phase_22_plugin_count() {
   mlc_off_out="$(LUNAVIM_CONFIG_DIR="$mlc_off_cfg" nvim --headless -u init.lua \
     -c "lua print('PLUGINS=' .. #require('lazy').plugins())" \
     -c 'qall!' 2>&1)"
-  mlc_off_n="$(grep -Eo 'PLUGINS=[0-9]+' <<<"$mlc_off_out" | head -1 | cut -d= -f2)"
+  mlc_off_n="$(grep -Eo 'PLUGINS=[0-9]+' <<<"${mlc_off_out//$'\r'/}" | head -1 | cut -d= -f2)"
   if [[ -z "$mlc_off_n" ]]; then
     printf 'could not read PLUGINS= count from mason-lspconfig-off run (output: %s)\n' \
       "$mlc_off_out" >&2
@@ -827,7 +898,7 @@ check(idx.gitsigns ~= nil and idx.gitsigns.event == 'BufReadPre', 'gitsigns even
 check(idx.lazydev ~= nil and idx.lazydev.ft == 'lua', 'lazydev ft must be lua'); \
 print(ok and 'LOAD_TRIGGERS_OK' or 'LOAD_TRIGGERS_BAD')" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^LOAD_TRIGGERS_OK$' <<<"$output"; then
+  if ! grep -q '^LOAD_TRIGGERS_OK$' <<<"${output//$'\r'/}"; then
     printf 'phase 2.2 load-trigger contract not satisfied (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -847,7 +918,7 @@ check_phase_23_commands_registered() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua local c = vim.api.nvim_get_commands({}); print('CMDS', c.LvimInfo ~= nil, c.LvimUpdate ~= nil, c.LvimSyncCorePlugins ~= nil, c.LvimReload ~= nil, c.LvimCacheReset ~= nil)" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^CMDS[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^CMDS[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 2.3 commands not all registered (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -870,7 +941,7 @@ check_phase_23_lvim_info_renders() {
   local key
   for key in 'Neovim version: ' 'lvim base dir: ' 'runtime dir: ' 'config dir: ' \
              'cache dir: ' 'user config path: ' 'plugin count: ' 'builtins: '; do
-    if ! grep -Fq "$key" <<<"$output"; then
+    if ! grep -Fq "$key" <<<"${output//$'\r'/}"; then
       printf 'phase 2.3 LvimInfo missing line %q (output: %s)\n' "$key" "$output" >&2
       return 1
     fi
@@ -916,7 +987,7 @@ check_phase_23_lvim_reload_reapplies_config() {
     -c 'LvimReload' \
     -c 'lua print("RELOAD_VAL=" .. tostring(lvim.builtin.telescope.active))' \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^RELOAD_VAL=false$' <<<"$output"; then
+  if ! grep -q '^RELOAD_VAL=false$' <<<"${output//$'\r'/}"; then
     printf 'phase 2.3 LvimReload did not re-apply user config (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -951,7 +1022,7 @@ check_phase_23_lvim_sync_core_plugins_dispatches() {
     -c 'LvimSyncCorePlugins!' \
     -c 'lua print("SYNC=" .. tostring(_G.__sync) .. " RESTORE=" .. tostring(_G.__restore))' \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^SYNC=false RESTORE=true$' <<<"$output"; then
+  if ! grep -q '^SYNC=false RESTORE=true$' <<<"${output//$'\r'/}"; then
     printf 'phase 2.3 LvimSyncCorePlugins did not restore from a non-empty snapshot (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -975,7 +1046,7 @@ check_phase_23_lvim_sync_core_plugins_dispatches() {
     -c 'LvimSyncCorePlugins!' \
     -c 'lua print("SYNC=" .. tostring(_G.__sync) .. " RESTORE=" .. tostring(_G.__restore))' \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^SYNC=true RESTORE=false$' <<<"$output"; then
+  if ! grep -q '^SYNC=true RESTORE=false$' <<<"${output//$'\r'/}"; then
     printf 'phase 2.3 LvimSyncCorePlugins did not fall back to lazy.sync on an empty snapshot (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -1001,7 +1072,7 @@ check_phase_23_acceptance_commands_literal() {
     -c "LvimInfo" \
     -c "lua print(vim.fn.getbufline('%', 1, '\$')[1])" \
     -c 'qall!' 2>&1)"
-  if ! grep -q 'Neovim' <<<"$output"; then
+  if ! grep -q 'Neovim' <<<"${output//$'\r'/}"; then
     printf 'phase 2.3 literal acceptance: :LvimInfo line 1 missing "Neovim" (output: %s)\n' \
       "$output" >&2
     return 1
@@ -1016,7 +1087,7 @@ check_phase_23_acceptance_commands_literal() {
     -c "silent! LvimReload" \
     -c "lua print('RELOAD_OK')" \
     -c 'qall!' 2>&1)"
-  if ! grep -q 'RELOAD_OK' <<<"$output"; then
+  if ! grep -q 'RELOAD_OK' <<<"${output//$'\r'/}"; then
     printf 'phase 2.3 literal acceptance: :LvimReload did not let RELOAD_OK print (output: %s)\n' \
       "$output" >&2
     return 1
@@ -1041,7 +1112,7 @@ check_phase_23_acceptance_commands_literal() {
     cfg_dir="$(make_empty_config_dir)"
     cmd_output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
       -c "echo exists(':$cmd')" -c 'qall!' 2>&1)"
-    if ! grep -q '^2$' <<<"$cmd_output"; then
+    if ! grep -q '^2$' <<<"${cmd_output//$'\r'/}"; then
       printf 'phase 2.3 literal acceptance: exists(":%s") did not return 2 (output: %s)\n' \
         "$cmd" "$cmd_output" >&2
       return 1
@@ -1073,13 +1144,13 @@ check_min_nvim_version_error() {
     return 1
   fi
 
-  if ! grep -Eq 'LunaVim requires Neovim >= 0\.11\.0' <<<"$stderr"; then
+  if ! grep -Eq 'LunaVim requires Neovim >= 0\.11\.0' <<<"${stderr//$'\r'/}"; then
     printf 'min-nvim version check missing required-version "0.11.0" in error on stderr (got rc=%d):\nstdout:\n%s\nstderr:\n%s\n' \
       "$rc" "$stdout" "$stderr" >&2
     return 1
   fi
 
-  if ! grep -Eq 'current version is 0\.10\.0' <<<"$stderr"; then
+  if ! grep -Eq 'current version is 0\.10\.0' <<<"${stderr//$'\r'/}"; then
     printf 'min-nvim version check missing current-version "0.10.0" in error on stderr (got rc=%d):\nstdout:\n%s\nstderr:\n%s\n' \
       "$rc" "$stdout" "$stderr" >&2
     return 1
@@ -1139,19 +1210,20 @@ check_phase_24_lvim_sync_core_plugins_initial_no_error() {
     return 1
   fi
 
-  if grep -Eq 'E[0-9]+:|Error detected while processing' <<<"$output"; then
+  if grep -Eq 'E[0-9]+:|Error detected while processing' \
+    <<<"$(strip_missing_plugin_errors <<<"${output//$'\r'/}")"; then
     printf 'phase 2.4: :LvimSyncCorePlugins emitted Neovim error (output: %s)\n' "$output" >&2
     return 1
   fi
 
   # The isolated snapshot is empty `{}`, so the sync path runs.
-  if ! grep -q 'SYNC=true' <<<"$output"; then
+  if ! grep -q 'SYNC=true' <<<"${output//$'\r'/}"; then
     printf 'phase 2.4: empty snapshot did not fall back to lazy.sync() (output: %s)\n' "$output" >&2
     return 1
   fi
 
   # Restore should NOT have been called because the snapshot is empty.
-  if grep -q 'RESTORE=true' <<<"$output"; then
+  if grep -q 'RESTORE=true' <<<"${output//$'\r'/}"; then
     printf 'phase 2.4: empty snapshot incorrectly triggered lazy.restore() (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -1190,12 +1262,12 @@ check_phase_24_non_empty_snapshot_restores() {
     return 1
   fi
 
-  if ! grep -q 'RESTORE=true' <<<"$output"; then
+  if ! grep -q 'RESTORE=true' <<<"${output//$'\r'/}"; then
     printf 'phase 2.4: non-empty snapshot did not invoke lazy.restore() (output: %s)\n' "$output" >&2
     return 1
   fi
 
-  if ! grep -q 'LOCK_EXISTS=true' <<<"$output"; then
+  if ! grep -q 'LOCK_EXISTS=true' <<<"${output//$'\r'/}"; then
     printf 'phase 2.4: snapshot was not copied onto <config>/lazy-lock.json (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -1363,7 +1435,7 @@ check_phase_25_second_launch_idempotency() {
     return 1
   fi
   stat1="$(stat -c '%Y %i' "$head_path")"
-  read -r mtime1 inode1 <<<"$stat1"
+  read -r mtime1 inode1 <<<"${stat1//$'\r'/}"
 
   t1="$(date +%s%N)"
   set +e
@@ -1378,7 +1450,7 @@ check_phase_25_second_launch_idempotency() {
   fi
 
   stat2="$(stat -c '%Y %i' "$head_path")"
-  read -r mtime2 inode2 <<<"$stat2"
+  read -r mtime2 inode2 <<<"${stat2//$'\r'/}"
   if [[ "$mtime1" != "$mtime2" ]]; then
     printf 'phase 2.5: second mtime differs from first (first=%s second=%s) — lazy.nvim was re-cloned\n' \
       "$mtime1" "$mtime2" >&2
@@ -1412,7 +1484,7 @@ check_phase_31_options_defaults_applied() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua print(vim.opt.number:get(), vim.opt.scrolloff:get(), vim.opt.shiftwidth:get())' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq 'true[[:space:]]+8[[:space:]]+2' <<<"$output"; then
+  if ! grep -Eq 'true[[:space:]]+8[[:space:]]+2' <<<"${output//$'\r'/}"; then
     printf 'phase 3.1: defaults not applied (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -1430,7 +1502,7 @@ check_phase_31_user_opt_override_wrap() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua print("WRAP=" .. tostring(vim.opt.wrap:get()))' \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^WRAP=true$' <<<"$output"; then
+  if ! grep -q '^WRAP=true$' <<<"${output//$'\r'/}"; then
     printf 'phase 3.1: lvim.opt override did not set wrap=true (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -1449,7 +1521,7 @@ check_phase_32_acceptance_commands_literal() {
   out_maparg="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua local m = vim.fn.maparg('<leader>w', 'n'); print(#m > 0)" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^true$' <<<"$out_maparg"; then
+  if ! grep -q '^true$' <<<"${out_maparg//$'\r'/}"; then
     printf 'phase 3.2 literal acceptance: maparg(<leader>w, n) did not return non-empty (output: %s)\n' \
       "$out_maparg" >&2
     return 1
@@ -1458,7 +1530,7 @@ check_phase_32_acceptance_commands_literal() {
   out_leader="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua print(vim.g.mapleader)" \
     -c 'qall!' 2>&1)"
-  if ! grep -F ' ' <<<"$out_leader" >/dev/null; then
+  if ! grep -F ' ' <<<"${out_leader//$'\r'/}" >/dev/null; then
     printf 'phase 3.2 literal acceptance: vim.g.mapleader output missing a space (output: %s)\n' \
       "$out_leader" >&2
     return 1
@@ -1481,15 +1553,25 @@ check_phase_32_space_leader_translation() {
   cfg_dir="$(mktemp -d -p "$SMOKE_TMP_BASE" leader-space-XXXXXX)"
   printf 'lvim.leader = "space"\n' > "$cfg_dir/config.lua"
 
+  # The comparison is made in Lua and reported as a single unambiguous token.
+  #
+  # Matching the printed value with an anchored `^LEADER=\[ \]$` was fragile in
+  # two ways: it depends on nothing else having been written to the same output
+  # line (any startup notice without a trailing newline breaks the `^` anchor,
+  # which is what made this fail on Neovim 0.11 while the leader was in fact a
+  # correct single space), and on the shell not eating the significant space.
+  # `LEADERCHK=ok` has neither problem. `LEADER=[...]`/`LEN=` are still printed
+  # so a failure message shows what the value actually was.
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
-    -c "lua print('LEADER=[' .. vim.g.mapleader .. ']')" \
-    -c "lua print('LEN=' .. #vim.g.mapleader)" \
+    -c "lua print('LEADERCHK=' .. (vim.g.mapleader == ' ' and 'ok' or 'bad'))" \
+    -c "lua print('LEADER=[' .. tostring(vim.g.mapleader) .. ']')" \
+    -c "lua print('LEN=' .. #tostring(vim.g.mapleader))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^LEADER=\[ \]$' <<<"$output"; then
+  if ! grep -q 'LEADERCHK=ok' <<<"${output//$'\r'/}"; then
     printf 'phase 3.2: lvim.leader="space" was not translated to a single space (output: %s)\n' "$output" >&2
     return 1
   fi
-  if ! grep -q '^LEN=1$' <<<"$output"; then
+  if ! grep -q '^LEN=1$' <<<"${output//$'\r'/}"; then
     printf 'phase 3.2: vim.g.mapleader length != 1 after "space" translation (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -1517,7 +1599,7 @@ check_phase_32_default_maps_registered() {
       ok('v','<'), ok('v','>'), \
       ok('x','J'), ok('x','K'))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^MAPS([[:space:]]+true){13}$' <<<"$output"; then
+  if ! grep -Eq '^MAPS([[:space:]]+true){13}$' <<<"${output//$'\r'/}"; then
     printf 'phase 3.2: not all 13 default mappings are registered (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -1552,15 +1634,15 @@ LUA
         print('USER_LX=' .. info('<leader>x')); \
         print('DEL_LQ=' .. info('<leader>q'))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q 'USER_CX=.*/yes' <<<"$output"; then
+  if ! grep -q 'USER_CX=.*/yes' <<<"${output//$'\r'/}"; then
     printf 'phase 3.2: user lvim.keys override (string form) not applied (output: %s)\n' "$output" >&2
     return 1
   fi
-  if ! grep -q 'USER_LX=User leader x/yes' <<<"$output"; then
+  if ! grep -q 'USER_LX=User leader x/yes' <<<"${output//$'\r'/}"; then
     printf 'phase 3.2: user lvim.keys override (table form) did not preserve desc (output: %s)\n' "$output" >&2
     return 1
   fi
-  if ! grep -q '^DEL_LQ=no$' <<<"$output"; then
+  if ! grep -q '^DEL_LQ=no$' <<<"${output//$'\r'/}"; then
     printf 'phase 3.2: user lvim.keys=false did not delete default <leader>q (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -1599,7 +1681,7 @@ check_phase_33_file_opened_fires_once() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua tests/minimal_init.lua \
     -c "lua vim.cmd('doautocmd BufReadPost'); print('FIRED=' .. tostring(vim.b.lvim_file_opened_fired))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^FIRED=true$' <<<"$output"; then
+  if ! grep -q '^FIRED=true$' <<<"${output//$'\r'/}"; then
     printf 'phase 3.3: BufReadPost did not set vim.b.lvim_file_opened_fired (output: %s)\n' \
       "$output" >&2
     return 1
@@ -1626,7 +1708,7 @@ check_phase_33_file_opened_skipped_on_empty_buffer() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua vim.api.nvim_exec_autocmds('BufRead', { group = 'lvim_file_opened' }); print('FIRED=' .. tostring(vim.b.lvim_file_opened_fired))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^FIRED=nil$' <<<"$output"; then
+  if ! grep -q '^FIRED=nil$' <<<"${output//$'\r'/}"; then
     printf 'phase 3.3: BufRead on a nameless buffer should leave the flag nil (output: %s)\n' \
       "$output" >&2
     return 1
@@ -1666,7 +1748,7 @@ check_phase_33_dir_opened_fires_when_listener_registered() {
     -u init.lua tests/ \
     -c 'lua print("DIR_OPENED=" .. tostring(_G.__dir_opened))' \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^DIR_OPENED=true$' <<<"$output"; then
+  if ! grep -q '^DIR_OPENED=true$' <<<"${output//$'\r'/}"; then
     printf 'phase 3.3: BufEnter on a directory did not fire User DirOpened (output: %s)\n' \
       "$output" >&2
     return 1
@@ -1679,7 +1761,7 @@ check_phase_33_dir_opened_fires_when_listener_registered() {
   # narrow — `^E[0-9]+:` at start-of-line — so plugin-stub messages embedded
   # in lazy.nvim's BufReadPre handler ("Plugin X is not installed") that
   # do NOT start with `E<n>:` cannot false-positive this check.
-  if grep -Eq '^E[0-9]+:' <<<"$output"; then
+  if grep -Eq '^E[0-9]+:' <<<"${output//$'\r'/}"; then
     printf 'phase 3.3: dir_opened smoke check emitted a Vim error (output: %s)\n' \
       "$output" >&2
     return 1
@@ -1717,7 +1799,7 @@ check_phase_33_dir_opened_re_emits_originating_event() {
     -c 'lua print("DIR_BUFENTER_COUNT=" .. tostring(_G.__dir_bufenter_count))' \
     -c 'qall!' 2>&1)"
   local count
-  count="$(grep -Eo 'DIR_BUFENTER_COUNT=[0-9]+' <<<"$output" | head -1 | cut -d= -f2)"
+  count="$(grep -Eo 'DIR_BUFENTER_COUNT=[0-9]+' <<<"${output//$'\r'/}" | head -1 | cut -d= -f2)"
   if [[ -z "$count" ]]; then
     printf 'phase 3.3: could not read DIR_BUFENTER_COUNT (output: %s)\n' "$output" >&2
     return 1
@@ -1752,7 +1834,7 @@ check_phase_33_file_opened_fires_on_new_file() {
     -u init.lua "$new_path" \
     -c 'lua print("FILE_OPENED=" .. tostring(_G.__file_opened_count))' \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^FILE_OPENED=1$' <<<"$output"; then
+  if ! grep -q '^FILE_OPENED=1$' <<<"${output//$'\r'/}"; then
     printf 'phase 3.3: BufNewFile path did not fire User FileOpened exactly once (output: %s)\n' \
       "$output" >&2
     return 1
@@ -1797,7 +1879,7 @@ check_phase_33_file_opened_fires_once_per_session() {
     -c "edit $second_path" \
     -c 'lua print("COUNT=" .. tostring(_G.__file_opened_count))' \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^COUNT=1$' <<<"$output"; then
+  if ! grep -q '^COUNT=1$' <<<"${output//$'\r'/}"; then
     printf 'phase 3.3: User FileOpened fired more than once across two file opens (output: %s)\n' \
       "$output" >&2
     return 1
@@ -1887,11 +1969,11 @@ check_phase_34_lvim_reload_reapplies_keymaps() {
     -c "LvimReload" \
     -c "lua print('AFTER=' .. #vim.fn.maparg('<leader>z', 'n'))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^BEFORE=0$' <<<"$output"; then
+  if ! grep -q '^BEFORE=0$' <<<"${output//$'\r'/}"; then
     printf 'phase 3.4: pre-reload delete of <leader>z did not take effect (output: %s)\n' "$output" >&2
     return 1
   fi
-  if ! grep -Eq '^AFTER=[1-9][0-9]*$' <<<"$output"; then
+  if ! grep -Eq '^AFTER=[1-9][0-9]*$' <<<"${output//$'\r'/}"; then
     printf 'phase 3.4: :LvimReload did not re-register <leader>z keymap (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -1916,7 +1998,7 @@ check_phase_34_lvim_reload_reapplies_options() {
     -c "LvimReload" \
     -c "lua print('SCROLLOFF=' .. vim.opt.scrolloff:get())" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^SCROLLOFF=17$' <<<"$output"; then
+  if ! grep -q '^SCROLLOFF=17$' <<<"${output//$'\r'/}"; then
     printf 'phase 3.4: :LvimReload did not re-apply lvim.opt.scrolloff=17 (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -1956,15 +2038,15 @@ check_phase_34_lvim_reload_rearms_autocmds() {
     -c "LvimReload" \
     -c "lua local ok, acs = pcall(vim.api.nvim_get_autocmds, { group = 'lvim_file_opened' }); print('AFTER=' .. tostring(ok)); print('COUNT=' .. (ok and #acs or -1))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^BEFORE=false$' <<<"$output"; then
+  if ! grep -q '^BEFORE=false$' <<<"${output//$'\r'/}"; then
     printf 'phase 3.4: pre-reload delete of lvim_file_opened augroup did not take effect (output: %s)\n' "$output" >&2
     return 1
   fi
-  if ! grep -q '^AFTER=true$' <<<"$output"; then
+  if ! grep -q '^AFTER=true$' <<<"${output//$'\r'/}"; then
     printf 'phase 3.4: :LvimReload did not re-arm lvim_file_opened augroup (output: %s)\n' "$output" >&2
     return 1
   fi
-  if ! grep -Eq '^COUNT=[1-9][0-9]*$' <<<"$output"; then
+  if ! grep -Eq '^COUNT=[1-9][0-9]*$' <<<"${output//$'\r'/}"; then
     printf 'phase 3.4: re-armed lvim_file_opened augroup has no autocmds registered (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -1982,7 +2064,7 @@ check_phase_34_lvim_reload_emits_notify() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "LvimReload" \
     -c 'qall!' 2>&1)"
-  if ! grep -q 'LvimReload OK' <<<"$output"; then
+  if ! grep -q 'LvimReload OK' <<<"${output//$'\r'/}"; then
     printf 'phase 3.4: :LvimReload did not emit "LvimReload OK" notification (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -2028,11 +2110,11 @@ check_phase_34_lvim_reload_literal_acceptance() {
     -c "LvimReload" \
     -c "lua print('MAPARG=' .. vim.fn.maparg('<leader>z', 'n'))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^PRE=0$' <<<"$output"; then
+  if ! grep -q '^PRE=0$' <<<"${output//$'\r'/}"; then
     printf 'phase 3.4 literal acceptance: pre-reload delete of <leader>z did not take effect (output: %s)\n' "$output" >&2
     return 1
   fi
-  if ! grep -qF 'MAPARG=:echo Z<CR>' <<<"$output"; then
+  if ! grep -qF 'MAPARG=:echo Z<CR>' <<<"${output//$'\r'/}"; then
     printf 'phase 3.4 literal acceptance: maparg(<leader>z, n) was empty or unexpected after :LvimReload (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -2060,7 +2142,7 @@ check_phase_34_keymaps_setup_idempotent() {
     -c "LvimReload" \
     -c "lua print('RHS=' .. vim.fn.maparg('<leader>w', 'n'))" \
     -c 'qall!' 2>&1)"
-  if ! grep -qF 'RHS=<Cmd>w<CR>' <<<"$output"; then
+  if ! grep -qF 'RHS=<Cmd>w<CR>' <<<"${output//$'\r'/}"; then
     printf 'phase 3.4: two LvimReload calls in a row did not leave <leader>w mapped to its canonical rhs (output: %s)\n' \
       "$output" >&2
     return 1
@@ -2185,11 +2267,11 @@ check_phase_41_lsp_setup_orchestration() {
     -c "lua print(type(require('mason'))=='table', type(require('lspconfig'))=='table', type(require('mason-lspconfig'))=='table')" \
     -c "lua print('ORDER=' .. table.concat(_G.__lvim_setup_order or {}, ','))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq 'true[[:space:]]+true[[:space:]]+true' <<<"$output"; then
+  if ! grep -Eq 'true[[:space:]]+true[[:space:]]+true' <<<"${output//$'\r'/}"; then
     printf 'phase 4.1: literal acceptance "true true true" not in output (output: %s)\n' "$output" >&2
     return 1
   fi
-  if ! grep -q '^ORDER=mason,mason-lspconfig$' <<<"$output"; then
+  if ! grep -q '^ORDER=mason,mason-lspconfig$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.1: setup order was not mason → mason-lspconfig (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -2222,7 +2304,7 @@ check_phase_41_lsp_setup_idempotent() {
     -c 'lua require("lvim.lsp").setup()' \
     -c 'lua print("MASON=" .. _G.__mason_calls .. " MLC=" .. _G.__mlc_calls)' \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^MASON=1 MLC=1$' <<<"$output"; then
+  if ! grep -q '^MASON=1 MLC=1$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.1: lvim.lsp.setup() not idempotent — mason/mason-lspconfig setup re-ran (output: %s)\n' \
       "$output" >&2
     return 1
@@ -2271,7 +2353,7 @@ check_phase_41_mason_toggle_skips_setup() {
     -u init.lua \
     -c 'lua print("MASON=" .. (_G.__mason_calls or 0) .. " MLC=" .. (_G.__mlc_calls or 0))' \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^MASON=0 MLC=0$' <<<"$output"; then
+  if ! grep -q '^MASON=0 MLC=0$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.1: disabling lvim.builtin.mason did not skip mason+mason-lspconfig setup (output: %s)\n' \
       "$output" >&2
     return 1
@@ -2348,7 +2430,7 @@ check_phase_42_defaults_table_present() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua local l = lvim.lsp; print(type(l.ensure_installed), type(l.servers), tostring(l.on_attach), tostring(l.capabilities), tostring(l.automatic_servers_installation), type(l.diagnostic))' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^table[[:space:]]+table[[:space:]]+nil[[:space:]]+nil[[:space:]]+false[[:space:]]+table$' <<<"$output"; then
+  if ! grep -Eq '^table[[:space:]]+table[[:space:]]+nil[[:space:]]+nil[[:space:]]+false[[:space:]]+table$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.2: lvim.lsp default shape wrong (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -2375,7 +2457,7 @@ check_phase_42_user_settings_flow_through() {
     -u init.lua \
     -c "lua print(vim.tbl_contains(vim.lsp.config['lua_ls'].settings.Lua.diagnostics.globals, 'vim'))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^true$' <<<"$output"; then
+  if ! grep -q '^true$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.2: user lua_ls.settings did not flow through to vim.lsp.config (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -2400,7 +2482,7 @@ check_phase_42_defaults_attached_to_each_server() {
     -u init.lua \
     -c "lua local c = vim.lsp.config['lua_ls']; print(type(c.on_attach), type(c.capabilities))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^function[[:space:]]+table$' <<<"$output"; then
+  if ! grep -Eq '^function[[:space:]]+table$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.2: default on_attach/capabilities not attached to server (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -2425,7 +2507,7 @@ LUA
     -u init.lua \
     -c "lua print(vim.lsp.config['lua_ls'].on_attach == _G.__custom_on_attach)" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^true$' <<<"$output"; then
+  if ! grep -q '^true$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.2: user lvim.lsp.on_attach did not replace default (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -2463,7 +2545,7 @@ local missing = {}; \
 for _, k in ipairs(want) do if seen[k] ~= true then all = false; missing[#missing + 1] = k end end; \
 print('KEYS', all, table.concat(missing, ','))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^KEYS[[:space:]]+true[[:space:]]*$' <<<"$output"; then
+  if ! grep -Eq '^KEYS[[:space:]]+true[[:space:]]*$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.2: default on_attach did not register expected buffer-local keymaps (output: %s)\n' \
       "$output" >&2
     return 1
@@ -2484,7 +2566,7 @@ check_phase_42_capabilities_baseline() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua local c = require('lvim.lsp.handlers').make_capabilities(); print(type(c), type(c.textDocument))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^table[[:space:]]+table$' <<<"$output"; then
+  if ! grep -Eq '^table[[:space:]]+table$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.2: make_capabilities() did not return a populated protocol table (output: %s)\n' \
       "$output" >&2
     return 1
@@ -2514,7 +2596,7 @@ LUA
     -u init.lua \
     -c "lua print('SENTINEL=' .. tostring(vim.lsp.config['lua_ls'].capabilities.__sentinel))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^SENTINEL=custom_caps_sentinel$' <<<"$output"; then
+  if ! grep -q '^SENTINEL=custom_caps_sentinel$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.2: user lvim.lsp.capabilities did not replace default (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -2544,7 +2626,7 @@ LUA
     -u init.lua \
     -c "lua local c = vim.lsp.config['lua_ls']; print('PER=' .. tostring(c.on_attach == _G.__per_server_fn) .. ' NOT_GLOBAL=' .. tostring(c.on_attach ~= _G.__global_fn))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^PER=true NOT_GLOBAL=true$' <<<"$output"; then
+  if ! grep -q '^PER=true NOT_GLOBAL=true$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.2: per-server config.on_attach did not override global lvim.lsp.on_attach (output: %s)\n' \
       "$output" >&2
     return 1
@@ -2574,7 +2656,7 @@ LUA
     -u init.lua \
     -c "lua print('MARKERS', vim.lsp.config['lua_ls'].settings.marker, vim.lsp.config['pyright'].settings.marker, vim.lsp.config['ts_ls'].settings.marker)" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^MARKERS[[:space:]]+lua_ls_marker[[:space:]]+pyright_marker[[:space:]]+ts_ls_marker$' <<<"$output"; then
+  if ! grep -Eq '^MARKERS[[:space:]]+lua_ls_marker[[:space:]]+pyright_marker[[:space:]]+ts_ls_marker$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.2: not all three servers received vim.lsp.config() with their per-server settings (output: %s)\n' \
       "$output" >&2
     return 1
@@ -2597,7 +2679,7 @@ check_phase_42_empty_servers_no_setup_calls() {
     -u init.lua \
     -c "lua print('ENABLED=' .. #_G.__lvim_enabled_servers)" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^ENABLED=0$' <<<"$output"; then
+  if ! grep -q '^ENABLED=0$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.2: empty lvim.lsp.servers should yield 0 vim.lsp.enable() calls (output: %s)\n' \
       "$output" >&2
     return 1
@@ -2620,7 +2702,7 @@ check_phase_42_blink_cmp_extends_capabilities() {
     -c "lua package.loaded['blink.cmp'] = { get_lsp_capabilities = function() return { __blink_marker = true } end }" \
     -c "lua local c = require('lvim.lsp.handlers').make_capabilities(); print('BLINK=' .. tostring(c.__blink_marker) .. ' BASE=' .. type(c.textDocument))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^BLINK=true BASE=table$' <<<"$output"; then
+  if ! grep -q '^BLINK=true BASE=table$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.2: make_capabilities() did not merge blink.cmp.get_lsp_capabilities() (output: %s)\n' \
       "$output" >&2
     return 1
@@ -2644,7 +2726,7 @@ check_phase_42_automatic_servers_installation_wired() {
     -u init.lua \
     -c "lua print('AUTOINST=' .. tostring((_G.__lvim_mlc_setup_opts or {}).automatic_installation))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^AUTOINST=true$' <<<"$output"; then
+  if ! grep -q '^AUTOINST=true$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.2: lvim.lsp.automatic_servers_installation was not forwarded to mason-lspconfig.setup (output: %s)\n' \
       "$output" >&2
     return 1
@@ -2668,7 +2750,7 @@ LUA
     -u init.lua \
     -c "lua local opts = _G.__lvim_mlc_setup_opts or {}; local list = opts.ensure_installed or {}; print('ENSURED=' .. table.concat(list, ','))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^ENSURED=lua_ls,ts_ls$' <<<"$output"; then
+  if ! grep -q '^ENSURED=lua_ls,ts_ls$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.2: lvim.lsp.ensure_installed was not forwarded to mason-lspconfig.setup (output: %s)\n' \
       "$output" >&2
     return 1
@@ -2759,7 +2841,7 @@ LUA
     -u init.lua \
     -c "lua local names = vim.deepcopy(_G.__lvim_enabled_servers); table.sort(names); print('ENABLED=' .. table.concat(names, ','))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^ENABLED=lua_ls,pyright,ts_ls$' <<<"$output"; then
+  if ! grep -q '^ENABLED=lua_ls,pyright,ts_ls$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.2: vim.lsp.enable not called for every server in lvim.lsp.servers (output: %s)\n' \
       "$output" >&2
     return 1
@@ -2796,7 +2878,7 @@ LUA
     -u init.lua \
     -c 'lua print("INDEX_COUNT=" .. tostring(_G.__lvim_lspconfig_index_count))' \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^INDEX_COUNT=0$' <<<"$output"; then
+  if ! grep -q '^INDEX_COUNT=0$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.2: orchestrator indexed lspconfig module (would trigger vim.deprecate on Neovim 0.11+) (output: %s)\n' \
       "$output" >&2
     return 1
@@ -2836,7 +2918,7 @@ check_phase_43_true_registers_autocmd() {
     -c "lua print('AUS=' .. #vim.api.nvim_get_autocmds({ group = 'lvim_format_on_save' }))" \
     -c 'qall!' 2>&1)"
   local n
-  n="$(grep -Eo 'AUS=[0-9]+' <<<"$output" | head -1 | cut -d= -f2)"
+  n="$(grep -Eo 'AUS=[0-9]+' <<<"${output//$'\r'/}" | head -1 | cut -d= -f2)"
   if [[ -z "$n" ]] || (( n < 1 )); then
     printf 'phase 4.3: lvim.format_on_save = true did not register autocmds in lvim_format_on_save (output: %s)\n' "$output" >&2
     return 1
@@ -2858,7 +2940,7 @@ check_phase_43_false_no_autocmd() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua local ok, aus = pcall(vim.api.nvim_get_autocmds, { group = 'lvim_format_on_save' }); print('AUS=' .. (ok and #aus or 0))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^AUS=0$' <<<"$output"; then
+  if ! grep -q '^AUS=0$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.3: lvim.format_on_save = false left autocmds in lvim_format_on_save (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -2884,7 +2966,7 @@ check_phase_43_table_form_honored() {
     -c "lua print('AUS=' .. #vim.api.nvim_get_autocmds({ group = 'lvim_format_on_save', event = 'BufWritePre' }))" \
     -c 'qall!' 2>&1)"
   local n
-  n="$(grep -Eo 'AUS=[0-9]+' <<<"$output" | head -1 | cut -d= -f2)"
+  n="$(grep -Eo 'AUS=[0-9]+' <<<"${output//$'\r'/}" | head -1 | cut -d= -f2)"
   if [[ -z "$n" ]] || (( n < 1 )); then
     printf 'phase 4.3: table form { enabled = true } did not register BufWritePre autocmd (output: %s)\n' "$output" >&2
     return 1
@@ -2895,7 +2977,7 @@ check_phase_43_table_form_honored() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua local ok, aus = pcall(vim.api.nvim_get_autocmds, { group = 'lvim_format_on_save' }); print('AUS=' .. (ok and #aus or 0))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^AUS=0$' <<<"$output"; then
+  if ! grep -q '^AUS=0$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.3: table form { enabled = false } registered autocmds (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -2918,7 +3000,7 @@ check_phase_43_reload_idempotent() {
     -c 'LvimReload' \
     -c "lua print('AUS=' .. #vim.api.nvim_get_autocmds({ group = 'lvim_format_on_save', event = 'BufWritePre' }))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^AUS=1$' <<<"$output"; then
+  if ! grep -q '^AUS=1$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.3: :LvimReload stacked autocmds in lvim_format_on_save (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -2952,7 +3034,7 @@ LUA
     -c 'doautocmd BufWritePre' \
     -c 'lua local f = _G.__filter; print(type(f) == "function", tostring(f and f({ name = "a" })), tostring(f and f({ name = "b" })), tostring(f and f({ name = "x" })))' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^true[[:space:]]+false[[:space:]]+true[[:space:]]+false$' <<<"$output"; then
+  if ! grep -Eq '^true[[:space:]]+false[[:space:]]+true[[:space:]]+false$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.3: exclude_clients filter did not drop named clients (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -2983,7 +3065,7 @@ LUA
     -c 'doautocmd BufWritePre' \
     -c 'lua local f = _G.__filter; print(type(f) == "function", tostring(f and f({ name = "a" })))' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.3: user-provided filter did not override exclude_clients (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3010,7 +3092,7 @@ check_phase_43_table_without_enabled_is_disabled() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua local ok, aus = pcall(vim.api.nvim_get_autocmds, { group = 'lvim_format_on_save' }); print('AUS=' .. (ok and #aus or 0))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^AUS=0$' <<<"$output"; then
+  if ! grep -q '^AUS=0$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.3: table without enabled key incorrectly registered format-on-save autocmd (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3024,7 +3106,7 @@ check_phase_43_table_without_enabled_is_disabled() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua local ok, aus = pcall(vim.api.nvim_get_autocmds, { group = 'lvim_format_on_save' }); print('AUS=' .. (ok and #aus or 0))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^AUS=0$' <<<"$output"; then
+  if ! grep -q '^AUS=0$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.3: empty-table form incorrectly registered format-on-save autocmd (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3047,7 +3129,7 @@ check_phase_43_true_normalizes_timeout_ms() {
     -c 'doautocmd BufWritePre' \
     -c 'lua print("TIMEOUT=" .. tostring(_G.__opts and _G.__opts.timeout_ms))' \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^TIMEOUT=1000$' <<<"$output"; then
+  if ! grep -q '^TIMEOUT=1000$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.3: lvim.format_on_save = true did not normalize timeout_ms to 1000 (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3072,7 +3154,7 @@ check_phase_43_table_form_timeout_ms_flows_through() {
     -c 'doautocmd BufWritePre' \
     -c 'lua print("TIMEOUT=" .. tostring(_G.__opts and _G.__opts.timeout_ms))' \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^TIMEOUT=2500$' <<<"$output"; then
+  if ! grep -q '^TIMEOUT=2500$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.3: table form { timeout_ms = 2500 } did not flow through to vim.lsp.buf.format (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3122,7 +3204,7 @@ check_phase_44_lazydev_setup_library_defaults() {
     -c "lua require('lvim.plugins.modules.lazydev').setup({})" \
     -c 'lua local o = _G.__lazydev_opts; local base = _G.get_lvim_base_dir(); local has_rt, has_base, has_lvim_word = false, false, false; for _, p in ipairs((o or {}).library or {}) do if p == vim.env.VIMRUNTIME then has_rt = true end; if type(p) == "table" and p.path == base then has_base = true; if type(p.words) == "table" then for _, w in ipairs(p.words) do if w == "lvim" then has_lvim_word = true end end end end end; print("LIB", has_rt, has_base, has_lvim_word)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^LIB[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^LIB[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.4: lazydev.setup library missing VIMRUNTIME, lvim base dir entry, or lvim words trigger (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3154,7 +3236,7 @@ check_phase_44_lazydev_setup_user_opts_merged() {
     -c "lua require('lvim.plugins.modules.lazydev').setup({})" \
     -c 'lua local o = _G.__lazydev_opts; local base = _G.get_lvim_base_dir(); local has_rt, has_base, has_extra = false, false, false; for _, p in ipairs((o or {}).library or {}) do if p == vim.env.VIMRUNTIME then has_rt = true end; if p == base or (type(p) == "table" and p.path == base) then has_base = true end; if p == "/tmp/extra-lib" then has_extra = true end end; print("MERGE", has_rt, has_base, has_extra, o and o.integrations and o.integrations.cmp == true)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^MERGE[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^MERGE[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.4: lazydev.setup did not deep-merge user opts with defaults (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3174,7 +3256,7 @@ check_phase_44_lazydev_setup_pcall_guards_missing() {
     -c 'lua package.loaded.lazydev = nil; package.preload.lazydev = nil' \
     -c "lua local ok, err = pcall(function() require('lvim.plugins.modules.lazydev').setup({}) end); print('PCALL', ok, err == nil)" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^PCALL[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^PCALL[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.4: lazydev module setup raised when plugin was unavailable (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3205,7 +3287,7 @@ check_phase_44_lazydev_literal_acceptance() {
     -c "lua package.preload.lazydev = function() return { setup = function() end } end" \
     -c "lua print(type(require('lazydev')))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^table$' <<<"$output"; then
+  if ! grep -q '^table$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.4 literal acceptance: require("lazydev") did not yield "table" (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3230,7 +3312,7 @@ check_phase_44_lazydev_loads_on_lua_ft() {
     -c "edit tests/fixtures/dummy.lua" \
     -c "lua local m = require('lazydev'); print('FT_LOAD', type(m) == 'table', _G.__lazydev_loaded == true)" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^FT_LOAD[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^FT_LOAD[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.4: lazydev did not load on FileType lua (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3298,7 +3380,7 @@ check_phase_45_diagnostic_config_defaults_applied() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua local c = vim.diagnostic.config(); print(c.severity_sort, c.virtual_text and 'vt' or 'no_vt')" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq 'true[[:space:]]+vt' <<<"$output"; then
+  if ! grep -Eq 'true[[:space:]]+vt' <<<"${output//$'\r'/}"; then
     printf 'phase 4.5 literal acceptance: severity_sort/virtual_text defaults not applied (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3316,7 +3398,7 @@ check_phase_45_signs_defined() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua local names = { 'DiagnosticSignError', 'DiagnosticSignWarn', 'DiagnosticSignInfo', 'DiagnosticSignHint' }; local ok = true; for _, n in ipairs(names) do local d = vim.fn.sign_getdefined(n); if not d or #d == 0 or not d[1].text or d[1].text == '' then ok = false; print('MISSING ' .. n) end end; print(ok and 'SIGNS_OK' or 'SIGNS_BAD')" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^SIGNS_OK$' <<<"$output"; then
+  if ! grep -q '^SIGNS_OK$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.5: not all diagnostic signs were defined with non-empty text (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3340,7 +3422,7 @@ check_phase_45_diagnostic_config_signs_table_has_text() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua local c = vim.diagnostic.config(); local s = c and c.signs; local t = type(s) == 'table' and s.text or nil; local sev = vim.diagnostic.severity; local function txt(name) if not t then return '' end; return t[name] or t[sev[name]] or '' end; print('SIGTBL', type(s), txt('ERROR'), txt('WARN'), txt('INFO'), txt('HINT'))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^SIGTBL[[:space:]]+table[[:space:]]+●[[:space:]]+●[[:space:]]+●[[:space:]]+●$' <<<"$output"; then
+  if ! grep -Eq '^SIGTBL[[:space:]]+table[[:space:]]+●[[:space:]]+●[[:space:]]+●[[:space:]]+●$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.5: vim.diagnostic.config().signs.text does not carry the prescribed glyphs for all four severities (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3363,7 +3445,7 @@ check_phase_45_signs_text_deep_merges_per_severity() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua local c = vim.diagnostic.config(); local t = c.signs and c.signs.text or {}; local sev = vim.diagnostic.severity; local function txt(name) return t[name] or t[sev[name]] or '' end; print('USIG', txt('ERROR'), txt('WARN'), txt('INFO'), txt('HINT'))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^USIG[[:space:]]+X[[:space:]]+●[[:space:]]+●[[:space:]]+●$' <<<"$output"; then
+  if ! grep -Eq '^USIG[[:space:]]+X[[:space:]]+●[[:space:]]+●[[:space:]]+●$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.5: user signs.text override clobbered sibling severities instead of deep-merging (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3395,7 +3477,7 @@ check_phase_45_signs_render_with_prescribed_glyph() {
     -c 'qall!' 2>&1)"
   # Neovim pads sign_text to two display cells, so the captured value is
   # either "●" plus a trailing space or just "●"; accept both shapes.
-  if ! grep -Eq '^GLYPH=●[[:space:]]?$' <<<"$output"; then
+  if ! grep -Eq '^GLYPH=●[[:space:]]?$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.5: rendered diagnostic sign text did not match the prescribed ● glyph (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3423,7 +3505,7 @@ check_phase_45_signs_numhl_render_with_prescribed_highlight() {
     -c "redraw" \
     -c "lua local function probe() local sub = vim.api.nvim_get_namespaces()['nvim.lvim45_numhl_probe.diagnostic.signs']; if not sub then return nil end; local marks = vim.api.nvim_buf_get_extmarks(0, sub, 0, -1, { details = true }); for _, m in ipairs(marks) do if m[4] and m[4].number_hl_group then return m[4].number_hl_group end end; return nil end; local hl; for _ = 1, 50 do hl = probe(); if hl then break end; vim.wait(20) end; print('NUMHL=' .. (hl or '<none>'))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^NUMHL=DiagnosticSignError$' <<<"$output"; then
+  if ! grep -Eq '^NUMHL=DiagnosticSignError$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.5: rendered diagnostic number_hl_group did not match DiagnosticSignError (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3455,7 +3537,7 @@ check_phase_45_signs_numhl_user_override_renders() {
     -c "redraw" \
     -c "lua local function probe() local sub = vim.api.nvim_get_namespaces()['nvim.lvim45_numhl_user_probe.diagnostic.signs']; if not sub then return nil end; local marks = vim.api.nvim_buf_get_extmarks(0, sub, 0, -1, { details = true }); for _, m in ipairs(marks) do if m[4] and m[4].number_hl_group then return m[4].number_hl_group end end; return nil end; local hl; for _ = 1, 50 do hl = probe(); if hl then break end; vim.wait(20) end; print('UNUMHL=' .. (hl or '<none>'))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^UNUMHL=MyErrHl$' <<<"$output"; then
+  if ! grep -Eq '^UNUMHL=MyErrHl$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.5: rendered diagnostic number_hl_group did not honor user string-keyed numhl override (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3477,7 +3559,7 @@ check_phase_45_user_overrides_merged() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua local c = vim.diagnostic.config(); print('OVR', c.update_in_insert, c.severity_sort, c.float and c.float.border, c.float and c.float.source)" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^OVR[[:space:]]+true[[:space:]]+true[[:space:]]+single[[:space:]]+always$' <<<"$output"; then
+  if ! grep -Eq '^OVR[[:space:]]+true[[:space:]]+true[[:space:]]+single[[:space:]]+always$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.5: user diagnostic overrides did not deep-merge with defaults (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3519,11 +3601,11 @@ check_phase_43_resetup_drains_augroup_when_disabled() {
     -c 'lua lvim.format_on_save = false; require("lvim.lsp.format").setup()' \
     -c "lua local ok, aus = pcall(vim.api.nvim_get_autocmds, { group = 'lvim_format_on_save' }); print('POST=' .. (ok and #aus or 0))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^PRE=[1-9][0-9]*$' <<<"$output"; then
+  if ! grep -Eq '^PRE=[1-9][0-9]*$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.3: enabled config did not register any autocmd before re-setup (output: %s)\n' "$output" >&2
     return 1
   fi
-  if ! grep -q '^POST=0$' <<<"$output"; then
+  if ! grep -q '^POST=0$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.3: re-setup did not drain augroup when format_on_save flipped to false (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3577,7 +3659,7 @@ check_phase_51_treesitter_defaults_shape() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua local t = lvim.builtin.treesitter; local have = {}; for _, p in ipairs(t.ensure_installed or {}) do have[p] = true end; local ok_required = true; for _, p in ipairs({ "lua", "vim", "vimdoc", "bash", "json", "comment" }) do if not have[p] then ok_required = false end end; local md_paired = (have["markdown"] == true and have["markdown_inline"] == true); print(t.active, ok_required, md_paired, t.highlight.enable, t.indent.enable, t.auto_install)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^true[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^true[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 5.1: lvim.builtin.treesitter defaults shape wrong (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3608,7 +3690,7 @@ check_phase_51_treesitter_setup_forwards_opts() {
     -c "lua require('lvim.plugins.modules.treesitter').setup({})" \
     -c 'lua local o = _G.__ts_opts or {}; local cli = vim.fn.executable("tree-sitter") == 1; local have = {}; for _, p in ipairs(o.ensure_installed or {}) do have[p] = true end; local parsers_ok; if cli then parsers_ok = (have["lua"] == true and have["vim"] == true and have["json"] == true and o.auto_install == true) else parsers_ok = (#(o.ensure_installed or {}) == 0 and o.auto_install == false) end; print("CAPTURED", type(o) == "table", parsers_ok, o.highlight and o.highlight.enable, o.indent and o.indent.enable, o.active == nil)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^CAPTURED[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^CAPTURED[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 5.1: treesitter module did not forward lvim.builtin.treesitter (minus active) to configs.setup (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3628,7 +3710,7 @@ check_phase_51_treesitter_setup_pcall_guards_missing() {
     -c 'lua package.loaded["nvim-treesitter.configs"] = nil; package.preload["nvim-treesitter.configs"] = nil' \
     -c "lua local ok, err = pcall(function() require('lvim.plugins.modules.treesitter').setup({}) end); print('PCALL', ok, err == nil)" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^PCALL[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^PCALL[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 5.1: treesitter module setup raised when nvim-treesitter.configs was unavailable (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3649,7 +3731,7 @@ check_phase_51_treesitter_toggle_drops_plugin() {
   baseline_out="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua print('PLUGINS=' .. #require('lazy').plugins())" \
     -c 'qall!' 2>&1)"
-  baseline_n="$(grep -Eo 'PLUGINS=[0-9]+' <<<"$baseline_out" | head -1 | cut -d= -f2)"
+  baseline_n="$(grep -Eo 'PLUGINS=[0-9]+' <<<"${baseline_out//$'\r'/}" | head -1 | cut -d= -f2)"
   if [[ -z "$baseline_n" ]]; then
     printf 'phase 5.1: could not read PLUGINS= baseline count (output: %s)\n' "$baseline_out" >&2
     return 1
@@ -3660,7 +3742,7 @@ check_phase_51_treesitter_toggle_drops_plugin() {
   toggled_out="$(LUNAVIM_CONFIG_DIR="$toggle_cfg" nvim --headless -u init.lua \
     -c "lua print('PLUGINS=' .. #require('lazy').plugins())" \
     -c 'qall!' 2>&1)"
-  toggled_n="$(grep -Eo 'PLUGINS=[0-9]+' <<<"$toggled_out" | head -1 | cut -d= -f2)"
+  toggled_n="$(grep -Eo 'PLUGINS=[0-9]+' <<<"${toggled_out//$'\r'/}" | head -1 | cut -d= -f2)"
   if [[ -z "$toggled_n" ]]; then
     printf 'phase 5.1: could not read PLUGINS= toggled count (output: %s)\n' "$toggled_out" >&2
     return 1
@@ -3679,7 +3761,7 @@ check_phase_51_treesitter_toggle_drops_plugin() {
   spec_out="$(LUNAVIM_CONFIG_DIR="$toggle_cfg" nvim --headless -u init.lua \
     -c "lua local found = false; for _, p in ipairs(require('lazy').plugins()) do if p.name == 'treesitter' then found = true end end; print('TS_IN_SPEC=' .. tostring(found))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^TS_IN_SPEC=false$' <<<"$spec_out"; then
+  if ! grep -q '^TS_IN_SPEC=false$' <<<"${spec_out//$'\r'/}"; then
     printf 'phase 5.1: treesitter spec entry still present after lvim.builtin.treesitter.active=false (output: %s)\n' "$spec_out" >&2
     return 1
   fi
@@ -3701,19 +3783,21 @@ check_phase_51_literal_require_nvim_treesitter() {
     -c "lua package.preload['nvim-treesitter'] = function() return {} end" \
     -c "lua print(type(require('nvim-treesitter')))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^table$' <<<"$output"; then
+  if ! grep -q '^table$' <<<"${output//$'\r'/}"; then
     printf 'phase 5.1 literal acceptance: require("nvim-treesitter") did not yield "table" (output: %s)\n' "$output" >&2
     return 1
   fi
 }
 
+
 check_phase_51_open_lua_file_no_error() {
   # Phase 5.1 acceptance: opening a `.lua` file headless should not error.
   # The treesitter spec uses `event = { 'BufReadPost', 'BufNewFile' }`, so
   # opening a .lua file fires the lazy-load trigger. With install.missing
-  # = false and no on-disk plugin, lazy.nvim emits a "Plugin X is not
-  # installed" notice but must not raise a Vim error (which would propagate
-  # to stderr as `E\d+:` or `Error detected while processing`). The
+  # = false and no on-disk plugin, lazy.nvim reports "Plugin X is not
+  # installed" -- a notice on Neovim 0.12, a raised error on 0.11. That noise
+  # is filtered out by `strip_missing_plugin_errors`; anything left must not be
+  # an error. The
   # treesitter module's pcall guard around `require('nvim-treesitter.configs')`
   # is the load-bearing piece that keeps the boot clean.
   local cfg_dir fixture output
@@ -3723,7 +3807,9 @@ check_phase_51_open_lua_file_no_error() {
 
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua "$fixture" \
     -c 'qall!' 2>&1)"
-  if grep -Eq '^E[0-9]+:|Error detected while processing' <<<"$output"; then
+  local real_errors
+  real_errors="$(strip_missing_plugin_errors <<<"${output//$'\r'/}")"
+  if grep -Eq '^E[0-9]+:|Error detected while processing|Error executing lua callback' <<<"$real_errors"; then
     printf 'phase 5.1: opening a .lua file headless produced a Vim error (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3768,7 +3854,7 @@ LUA
   # false, and the CLI-missing path forces it false too, so the two agree.
   # `ensure_installed` is CLI-conditional for the reason documented on
   # check_phase_51_treesitter_setup_forwards_opts.
-  if ! grep -Eq '^USER_TS[[:space:]]+true[[:space:]]+false[[:space:]]+true[[:space:]]+false[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^USER_TS[[:space:]]+true[[:space:]]+false[[:space:]]+true[[:space:]]+false[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 5.1: user override of lvim.builtin.treesitter did not flow through to configs.setup (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3799,7 +3885,7 @@ check_phase_51_setup_does_not_mutate_builtin() {
   # not about which parsers ship, and pinning the exact list here duplicated
   # check_phase_51_treesitter_defaults_shape and broke for the same reason
   # (parsers were added to defaults.lua and the literal was never updated).
-  if ! grep -Eq '^LIVE[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^LIVE[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 5.1: configs.setup observably mutated lvim.builtin.treesitter (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3835,7 +3921,7 @@ check_phase_52_comment_defaults_shape() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua local c = lvim.builtin.comment; print(c.active, type(c.options), next(c.options) == nil)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^true[[:space:]]+table[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^true[[:space:]]+table[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 5.2: lvim.builtin.comment defaults shape wrong (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3855,7 +3941,7 @@ check_phase_52_setup_forwards_options_and_pre_hook() {
     -c "lua require('lvim.plugins.modules.comment').setup({})" \
     -c 'lua local o = _G.__mini_opts or {}; print("CAPTURED", type(o), type(o.options), type(o.hooks), type(o.hooks and o.hooks.pre))' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^CAPTURED[[:space:]]+table[[:space:]]+table[[:space:]]+table[[:space:]]+function$' <<<"$output"; then
+  if ! grep -Eq '^CAPTURED[[:space:]]+table[[:space:]]+table[[:space:]]+table[[:space:]]+function$' <<<"${output//$'\r'/}"; then
     printf 'phase 5.2: comment module did not forward {options, hooks.pre} to mini.comment.setup (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3876,7 +3962,7 @@ LUA
     -c "lua require('lvim.plugins.modules.comment').setup({})" \
     -c 'lua local o = (_G.__mini_opts or {}).options or {}; print("USER", o.ignore_blank_line, o.custom_key)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^USER[[:space:]]+true[[:space:]]+x$' <<<"$output"; then
+  if ! grep -Eq '^USER[[:space:]]+true[[:space:]]+x$' <<<"${output//$'\r'/}"; then
     printf 'phase 5.2: user override of lvim.builtin.comment.options did not flow through (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3895,7 +3981,7 @@ check_phase_52_setup_pcall_guards_missing() {
     -c 'lua package.loaded["mini.comment"] = nil; package.preload["mini.comment"] = nil' \
     -c "lua local ok, err = pcall(function() require('lvim.plugins.modules.comment').setup({}) end); print('PCALL', ok, err == nil)" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^PCALL[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^PCALL[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 5.2: comment module setup raised when mini.comment was unavailable (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3916,11 +4002,11 @@ check_phase_52_pre_hook_sets_jsx_commentstring_for_tsx_ft() {
     -c "lua require('lvim.plugins.modules.comment').setup({})" \
     -c 'lua local function exercise(ft, label) vim.cmd("enew"); vim.bo.filetype = ft; vim.bo.commentstring = "// %s"; _G.__mini_opts.hooks.pre({ action = "toggle" }); print(label .. "=" .. vim.bo.commentstring) end; exercise("typescriptreact", "TSX_CS"); exercise("javascriptreact", "JSX_CS")' \
     -c 'qall!' 2>&1)"
-  if ! grep -Fq 'TSX_CS={/* %s */}' <<<"$output"; then
+  if ! grep -Fq 'TSX_CS={/* %s */}' <<<"${output//$'\r'/}"; then
     printf 'phase 5.2: pre hook did not set JSX commentstring for typescriptreact (output: %s)\n' "$output" >&2
     return 1
   fi
-  if ! grep -Fq 'JSX_CS={/* %s */}' <<<"$output"; then
+  if ! grep -Fq 'JSX_CS={/* %s */}' <<<"${output//$'\r'/}"; then
     printf 'phase 5.2: pre hook did not set JSX commentstring for javascriptreact (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3941,7 +4027,7 @@ check_phase_52_pre_hook_leaves_non_jsx_buffer_alone() {
     -c 'lua _G.__mini_opts.hooks.pre({ action = "toggle" })' \
     -c 'lua print("LUA_CS=" .. vim.bo.commentstring)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Fq 'LUA_CS=-- %s' <<<"$output"; then
+  if ! grep -Fq 'LUA_CS=-- %s' <<<"${output//$'\r'/}"; then
     printf 'phase 5.2: pre hook unexpectedly mutated commentstring for a non-JSX buffer (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3968,7 +4054,7 @@ check_phase_52_pre_hook_prefers_treesitter_node_when_available() {
     -c 'lua _G.__mini_opts.hooks.pre({ action = "toggle", ref_position = { 1, 0 } })' \
     -c 'lua print("TS_CS=" .. vim.bo.commentstring)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Fq 'TS_CS={/* %s */}' <<<"$output"; then
+  if ! grep -Fq 'TS_CS={/* %s */}' <<<"${output//$'\r'/}"; then
     printf 'phase 5.2: pre hook ignored the treesitter jsx node type (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -3992,7 +4078,7 @@ check_phase_52_pre_hook_walks_parent_chain_for_jsx() {
     -c 'lua _G.__mini_opts.hooks.pre({ action = "toggle", ref_position = { 1, 0 } })' \
     -c 'lua print("TS_PARENT_CS=" .. vim.bo.commentstring)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Fq 'TS_PARENT_CS={/* %s */}' <<<"$output"; then
+  if ! grep -Fq 'TS_PARENT_CS={/* %s */}' <<<"${output//$'\r'/}"; then
     printf 'phase 5.2: pre hook did not walk parent chain to find ancestor jsx node (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -4018,7 +4104,7 @@ check_phase_52_pre_hook_uses_ref_position_not_cursor() {
     -c 'lua _G.__mini_opts.hooks.pre({ action = "toggle", ref_position = { 7, 3 } })' \
     -c 'lua local p = _G.__captured_pos or {}; print("REFPOS", p[1], p[2])' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^REFPOS[[:space:]]+6[[:space:]]+2$' <<<"$output"; then
+  if ! grep -Eq '^REFPOS[[:space:]]+6[[:space:]]+2$' <<<"${output//$'\r'/}"; then
     printf 'phase 5.2: pre hook did not pass ref_position into get_node as fully-0-indexed pos (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -4046,7 +4132,7 @@ check_phase_52_pre_hook_trusts_treesitter_over_filetype() {
     -c 'lua _G.__mini_opts.hooks.pre({ action = "toggle", ref_position = { 1, 1 } })' \
     -c 'lua print("NON_JSX_CS=" .. vim.bo.commentstring)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Fq 'NON_JSX_CS=// %s' <<<"$output"; then
+  if ! grep -Fq 'NON_JSX_CS=// %s' <<<"${output//$'\r'/}"; then
     printf 'phase 5.2: pre hook flipped commentstring even though treesitter said the node is not JSX (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -4073,11 +4159,11 @@ check_phase_52_pre_hook_round_trip_resets_jsx_on_tsx_buffer() {
     -c 'setlocal filetype=typescriptreact commentstring=//\ %s' \
     -c 'lua local jsx = { type = function() return "jsx_element" end, parent = function() return nil end }; vim.treesitter.get_node = function() return jsx end; _G.__mini_opts.hooks.pre({ action = "toggle", ref_position = { 1, 1 } }); print("AFTER_JSX_CS=" .. vim.bo.commentstring); local prog = { type = function() return "program" end, parent = function() return nil end }; vim.treesitter.get_node = function() return prog end; _G.__mini_opts.hooks.pre({ action = "toggle", ref_position = { 2, 1 } }); print("AFTER_NONJSX_CS=" .. vim.bo.commentstring)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Fq 'AFTER_JSX_CS={/* %s */}' <<<"$output"; then
+  if ! grep -Fq 'AFTER_JSX_CS={/* %s */}' <<<"${output//$'\r'/}"; then
     printf 'phase 5.2: pre hook did not flip commentstring to JSX on jsx_element (output: %s)\n' "$output" >&2
     return 1
   fi
-  if ! grep -Fq 'AFTER_NONJSX_CS=// %s' <<<"$output"; then
+  if ! grep -Fq 'AFTER_NONJSX_CS=// %s' <<<"${output//$'\r'/}"; then
     printf 'phase 5.2: pre hook did not reset commentstring to // %%s after leaving JSX region (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -4102,7 +4188,7 @@ check_phase_52_pre_hook_does_not_touch_non_jsx_filetype_on_non_jsx_node() {
     -c 'lua _G.__mini_opts.hooks.pre({ action = "toggle", ref_position = { 1, 1 } })' \
     -c 'lua print("LUA_TS_CS=" .. vim.bo.commentstring)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Fq 'LUA_TS_CS=-- %s' <<<"$output"; then
+  if ! grep -Fq 'LUA_TS_CS=-- %s' <<<"${output//$'\r'/}"; then
     printf 'phase 5.2: pre hook unexpectedly overwrote commentstring on a non-JSX filetype with TS node (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -4167,7 +4253,7 @@ check_phase_52_acceptance_command_literal() {
     -c "normal Vgcc" \
     -c 'lua print("RESULT=" .. vim.api.nvim_buf_get_lines(0, 0, -1, false)[1])' \
     -c 'qall!' 2>&1)"
-  if ! grep -Fq 'RESULT={/*' <<<"$output"; then
+  if ! grep -Fq 'RESULT={/*' <<<"${output//$'\r'/}"; then
     printf 'phase 5.2 literal acceptance: Vgcc on sample.tsx did not wrap the line in JSX comment (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -4224,7 +4310,7 @@ check_phase_53_tsupdate_scheduled_when_treesitter_active() {
     -c 'lua vim.wait(500, function() return _G.__ts_called end)' \
     -c 'lua print("TS_CALLED=" .. tostring(_G.__ts_called))' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq "$want" <<<"$output"; then
+  if ! grep -Eq "$want" <<<"${output//$'\r'/}"; then
     printf 'phase 5.3: TSUpdate scheduling did not match the tree-sitter CLI state (wanted %s, output: %s)\n' \
       "$want" "$output" >&2
     return 1
@@ -4247,7 +4333,7 @@ check_phase_53_tsupdate_skipped_when_treesitter_inactive() {
     -c 'lua vim.wait(200)' \
     -c 'lua print("TS_CALLED=" .. tostring(_G.__ts_called))' \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^TS_CALLED=false$' <<<"$output"; then
+  if ! grep -q '^TS_CALLED=false$' <<<"${output//$'\r'/}"; then
     printf 'phase 5.3: TSUpdate fired despite lvim.builtin.treesitter.active=false (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -4279,11 +4365,12 @@ check_phase_53_sync_completes_when_treesitter_not_loaded() {
     printf 'phase 5.3: LvimSyncCorePlugins exited non-zero when treesitter not loaded (rc=%d, output: %s)\n' "$rc" "$output" >&2
     return 1
   fi
-  if grep -Eq 'E[0-9]+:|Error detected while processing' <<<"$output"; then
+  if grep -Eq 'E[0-9]+:|Error detected while processing' \
+    <<<"$(strip_missing_plugin_errors <<<"${output//$'\r'/}")"; then
     printf 'phase 5.3: silent-skip path leaked a Neovim error pattern (output: %s)\n' "$output" >&2
     return 1
   fi
-  if ! grep -q '^SYNC_CALLED=true$' <<<"$output"; then
+  if ! grep -q '^SYNC_CALLED=true$' <<<"${output//$'\r'/}"; then
     printf 'phase 5.3: sync was not called when treesitter not loaded (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -4329,11 +4416,12 @@ check_phase_53_tsupdate_error_does_not_abort_sync() {
     printf 'phase 5.3: LvimSyncCorePlugins exited non-zero when TSUpdate throws (rc=%d, output: %s)\n' "$rc" "$output" >&2
     return 1
   fi
-  if grep -Eq 'E[0-9]+:|Error detected while processing' <<<"$output"; then
+  if grep -Eq 'E[0-9]+:|Error detected while processing' \
+    <<<"$(strip_missing_plugin_errors <<<"${output//$'\r'/}")"; then
     printf 'phase 5.3: TSUpdate pcall failure leaked a Neovim error pattern (output: %s)\n' "$output" >&2
     return 1
   fi
-  if ! grep -q '^SYNC_CALLED=true$' <<<"$output"; then
+  if ! grep -q '^SYNC_CALLED=true$' <<<"${output//$'\r'/}"; then
     printf 'phase 5.3: sync was not called when TSUpdate throws (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -4345,12 +4433,12 @@ check_phase_53_tsupdate_error_does_not_abort_sync() {
   # goes unexercised. Demanding WARN_CALLED=true unconditionally made this
   # check fail on every host lacking the CLI, CI images included.
   if command -v tree-sitter >/dev/null 2>&1; then
-    if ! grep -q '^WARN_CALLED=true$' <<<"$output"; then
+    if ! grep -q '^WARN_CALLED=true$' <<<"${output//$'\r'/}"; then
       printf 'phase 5.3: pcall branch did not fire (WARN notify not observed) — test did not actually exercise the error path (output: %s)\n' "$output" >&2
       return 1
     fi
   else
-    if ! grep -q '^WARN_CALLED=false$' <<<"$output"; then
+    if ! grep -q '^WARN_CALLED=false$' <<<"${output//$'\r'/}"; then
       printf 'phase 5.3: TSUpdate ran despite the tree-sitter CLI being absent (output: %s)\n' "$output" >&2
       return 1
     fi
@@ -4386,7 +4474,7 @@ check_phase_6_telescope_defaults_shape() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua local t = lvim.builtin.telescope; print(t.active, type(t.defaults), type(t.pickers), type(t.extensions), type(t.defaults.file_ignore_patterns), type(t.defaults.layout_strategy), type(t.defaults.mappings))' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^true[[:space:]]+table[[:space:]]+table[[:space:]]+table[[:space:]]+table[[:space:]]+string[[:space:]]+table$' <<<"$output"; then
+  if ! grep -Eq '^true[[:space:]]+table[[:space:]]+table[[:space:]]+table[[:space:]]+table[[:space:]]+string[[:space:]]+table$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 telescope: lvim.builtin.telescope defaults shape wrong (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -4402,7 +4490,7 @@ check_phase_6_telescope_defaults_mappings_cn_cp() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua local m = lvim.builtin.telescope.defaults.mappings.i or {}; print("CN=" .. tostring(m["<C-n>"]) .. " CP=" .. tostring(m["<C-p>"]))' \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^CN=move_selection_next CP=move_selection_previous$' <<<"$output"; then
+  if ! grep -q '^CN=move_selection_next CP=move_selection_previous$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 telescope: defaults.mappings.i missing <C-n>/<C-p> bindings (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -4425,7 +4513,7 @@ check_phase_6_telescope_setup_forwards_opts() {
     -c "lua require('lvim.plugins.modules.telescope').setup({})" \
     -c 'lua local o = _G.__tel_opts or {}; print("CAPTURED", type(o), type(o.defaults), type(o.pickers), type(o.extensions), o.active == nil)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^CAPTURED[[:space:]]+table[[:space:]]+table[[:space:]]+table[[:space:]]+table[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^CAPTURED[[:space:]]+table[[:space:]]+table[[:space:]]+table[[:space:]]+table[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 telescope: module did not forward lvim.builtin.telescope (minus active) to telescope.setup (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -4443,7 +4531,7 @@ check_phase_6_telescope_setup_pcall_guards_missing() {
     -c 'lua package.loaded.telescope = nil; package.preload.telescope = nil' \
     -c "lua local ok, err = pcall(function() require('lvim.plugins.modules.telescope').setup({}) end); print('PCALL', ok, err == nil)" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^PCALL[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^PCALL[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 telescope: module setup raised when telescope was unavailable (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -4460,7 +4548,7 @@ check_phase_6_telescope_leader_f_group_maps_registered() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua local function ok(lhs) return #vim.fn.maparg(lhs, 'n') > 0 end; print('FGROUP', ok('<leader>ff'), ok('<leader>fg'), ok('<leader>fb'), ok('<leader>fh'))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^FGROUP[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^FGROUP[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 telescope: <leader>f telescope group mappings not all registered (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -4497,7 +4585,7 @@ check_phase_6_nvimtree_defaults_shape() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua local t = lvim.builtin.nvimtree; local s = t.setup or {}; print(t.active, type(s), type(s.view), s.view and s.view.width, type(s.renderer), type(s.filters), s.filters and s.filters.dotfiles, s.filters and s.filters.git_ignored)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^true[[:space:]]+table[[:space:]]+table[[:space:]]+30[[:space:]]+table[[:space:]]+table[[:space:]]+false[[:space:]]+false$' <<<"$output"; then
+  if ! grep -Eq '^true[[:space:]]+table[[:space:]]+table[[:space:]]+30[[:space:]]+table[[:space:]]+table[[:space:]]+false[[:space:]]+false$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 nvimtree: lvim.builtin.nvimtree defaults shape wrong (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -4522,7 +4610,7 @@ check_phase_6_nvimtree_lvimexplorer_focuses_new_sidebar() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua local before = vim.api.nvim_get_current_win(); vim.bo.filetype = "NvimTree"; vim.cmd("LvimExplorer"); local cur = vim.api.nvim_get_current_win(); print("EXP", #vim.api.nvim_list_wins(), cur == before, vim.bo[vim.api.nvim_win_get_buf(cur)].filetype == "NvimTree")' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^EXP[[:space:]]+2[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^EXP[[:space:]]+2[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 nvimtree: LvimExplorer did not split the sidebar and keep focus in the tree (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -4540,7 +4628,7 @@ check_phase_6_nvimtree_on_attach_cr_passes_node() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua local captured, got; local node = { name = "sentinel" }; package.loaded["nvim-tree"] = { setup = function(o) captured = o end }; package.loaded["nvim-tree.api"] = { tree = { get_node_under_cursor = function() return node end, change_root_to_node = function(n) got = n end }, node = { open = { edit = function(n) got = n end, vertical = function(n) got = n end }, navigate = { parent_close = function(n) got = n end } }, config = { mappings = { default_on_attach = function(_) end } } }; require("lvim.plugins.modules.nvimtree").setup({}); local bufnr = vim.api.nvim_create_buf(false, true); captured.on_attach(bufnr); vim.api.nvim_set_current_buf(bufnr); local m = vim.fn.maparg("<CR>", "n", false, true); if type(m) == "table" and type(m.callback) == "function" then m.callback() end; print("NODEMAP", got == node)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^NODEMAP[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^NODEMAP[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     # shellcheck disable=SC2016  # the backticks are prose, not a command
     # substitution, and there is nothing to expand in this format string.
     printf 'phase 6 nvimtree: on_attach `<CR>` mapping did not pass the current node into api.node.open.edit (output: %s)\n' "$output" >&2
@@ -4564,7 +4652,7 @@ check_phase_6_nvimtree_setup_disables_netrw() {
     -c "lua require('lvim.plugins.modules.nvimtree').setup({})" \
     -c 'lua local s = _G.__nt_at_setup or {}; print("NETRW", s.netrw, s.plugin, vim.g.loaded_netrw, vim.g.loaded_netrwPlugin)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^NETRW[[:space:]]+1[[:space:]]+1[[:space:]]+1[[:space:]]+1$' <<<"$output"; then
+  if ! grep -Eq '^NETRW[[:space:]]+1[[:space:]]+1[[:space:]]+1[[:space:]]+1$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 nvimtree: setup did not disable netrw before require("nvim-tree").setup (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -4588,7 +4676,7 @@ check_phase_6_nvimtree_setup_forwards_opts() {
     -c "lua require('lvim.plugins.modules.nvimtree').setup({})" \
     -c 'lua local o = _G.__nt_opts or {}; print("CAPTURED", type(o), type(o.view), o.view and o.view.width, type(o.renderer), type(o.filters), o.filters and o.filters.dotfiles, o.active == nil)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^CAPTURED[[:space:]]+table[[:space:]]+table[[:space:]]+30[[:space:]]+table[[:space:]]+table[[:space:]]+false[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^CAPTURED[[:space:]]+table[[:space:]]+table[[:space:]]+30[[:space:]]+table[[:space:]]+table[[:space:]]+false[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 nvimtree: module did not forward lvim.builtin.nvimtree.setup to nvim-tree.setup (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -4606,7 +4694,7 @@ check_phase_6_nvimtree_setup_pcall_guards_missing() {
     -c 'lua package.loaded["nvim-tree"] = nil; package.preload["nvim-tree"] = nil' \
     -c "lua local ok, err = pcall(function() require('lvim.plugins.modules.nvimtree').setup({}) end); print('PCALL', ok, err == nil)" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^PCALL[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^PCALL[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 nvimtree: module setup raised when nvim-tree was unavailable (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -4629,7 +4717,7 @@ check_phase_6_nvimtree_leader_e_map_registered() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua local rhs = vim.fn.maparg('<leader>e', 'n'); print('MAP=' .. rhs .. ' CMD=' .. tostring(vim.fn.exists(':LvimExplorer') == 2))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^MAP=.*LvimExplorer.* CMD=true$' <<<"$output"; then
+  if ! grep -q '^MAP=.*LvimExplorer.* CMD=true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 nvimtree: <leader>e mapping missing, wrong rhs, or :LvimExplorer undefined (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -4651,7 +4739,8 @@ check_phase_6_nvimtree_toggle_does_not_error() {
     -c 'NvimTreeToggle' -c 'qall!' 2>&1)"
   rc=$?
   set -e
-  if (( rc != 0 )) || grep -Eq 'E[0-9]+:|Error detected while processing' <<<"$output"; then
+  if (( rc != 0 )) || grep -Eq 'E[0-9]+:|Error detected while processing' \
+    <<<"$(strip_missing_plugin_errors <<<"${output//$'\r'/}")"; then
     printf 'phase 6 nvimtree: NvimTreeToggle errored on headless boot (rc=%d output: %s)\n' \
       "$rc" "$output" >&2
     return 1
@@ -4677,7 +4766,7 @@ LUA
     -c "lua require('lvim.plugins.modules.nvimtree').setup({})" \
     -c 'lua local o = _G.__nt_user_opts or {}; print("USER_NT", o.view and o.view.width, o.hijack_directories and o.hijack_directories.enable, o.filters and o.filters.dotfiles)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^USER_NT[[:space:]]+42[[:space:]]+true[[:space:]]+false$' <<<"$output"; then
+  if ! grep -Eq '^USER_NT[[:space:]]+42[[:space:]]+true[[:space:]]+false$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 nvimtree: user override of lvim.builtin.nvimtree.setup did not flow through to nvim-tree.setup (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -4704,7 +4793,7 @@ LUA
     -c "lua require('lvim.plugins.modules.telescope').setup({})" \
     -c 'lua local o = _G.__tel_user_opts or {}; print("USER_TS", o.defaults and o.defaults.layout_strategy, o.pickers and o.pickers.find_files and o.pickers.find_files.hidden, o.active == nil)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^USER_TS[[:space:]]+vertical[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^USER_TS[[:space:]]+vertical[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 telescope: user override of lvim.builtin.telescope did not flow through to telescope.setup (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -4733,7 +4822,7 @@ check_phase_6_nvimtree_setup_does_not_mutate_builtin() {
     -c "lua require('lvim.plugins.modules.nvimtree').setup({})" \
     -c 'lua local s = lvim.builtin.nvimtree.setup; print("LIVE_NT", s.view.width, s.filters.dotfiles, s.renderer.indent_markers.enable)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^LIVE_NT[[:space:]]+30[[:space:]]+false[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^LIVE_NT[[:space:]]+30[[:space:]]+false[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 nvimtree: nvim-tree.setup observably mutated lvim.builtin.nvimtree.setup (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -4761,7 +4850,7 @@ check_phase_6_nvimtree_literal_acceptance_require_returns_table() {
     -c 'lua package.loaded["nvim-tree"] = { setup = function(_) end }' \
     -c "lua print(type(require('nvim-tree')))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q 'table' <<<"$output"; then
+  if ! grep -q 'table' <<<"${output//$'\r'/}"; then
     printf 'phase 6 nvimtree: literal acceptance print(type(require("nvim-tree"))) did not emit "table" (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -4786,7 +4875,7 @@ check_phase_6_nvimtree_toggle_drops_nvimtree_specifically() {
   baseline_out="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua local has = false; for _, p in pairs(require('lazy.core.config').plugins) do if (p[1] == 'nvim-tree/nvim-tree.lua') or (p.url and p.url:match('nvim%-tree/nvim%-tree%.lua')) then has = true; break end end; print('NT=' .. tostring(has))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^NT=true$' <<<"$baseline_out"; then
+  if ! grep -Eq '^NT=true$' <<<"${baseline_out//$'\r'/}"; then
     printf 'phase 6 nvimtree toggle: nvim-tree/nvim-tree.lua not present in Config.plugins under baseline (output: %s)\n' "$baseline_out" >&2
     return 1
   fi
@@ -4796,7 +4885,7 @@ check_phase_6_nvimtree_toggle_drops_nvimtree_specifically() {
   toggled_out="$(LUNAVIM_CONFIG_DIR="$toggle_cfg" nvim --headless -u init.lua \
     -c "lua local has = false; for _, p in pairs(require('lazy.core.config').plugins) do if (p[1] == 'nvim-tree/nvim-tree.lua') or (p.url and p.url:match('nvim%-tree/nvim%-tree%.lua')) then has = true; break end end; print('NT=' .. tostring(has))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^NT=false$' <<<"$toggled_out"; then
+  if ! grep -Eq '^NT=false$' <<<"${toggled_out//$'\r'/}"; then
     printf 'phase 6 nvimtree toggle: nvim-tree/nvim-tree.lua still present in Config.plugins with nvimtree.active=false (output: %s)\n' "$toggled_out" >&2
     return 1
   fi
@@ -4826,7 +4915,7 @@ check_phase_6_telescope_setup_does_not_mutate_builtin() {
     -c "lua require('lvim.plugins.modules.telescope').setup({})" \
     -c 'lua local t = lvim.builtin.telescope; print("LIVE", t.active, t.defaults.layout_strategy, t.defaults.mappings.i["<C-n>"])' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^LIVE[[:space:]]+true[[:space:]]+horizontal[[:space:]]+move_selection_next$' <<<"$output"; then
+  if ! grep -Eq '^LIVE[[:space:]]+true[[:space:]]+horizontal[[:space:]]+move_selection_next$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 telescope: telescope.setup observably mutated lvim.builtin.telescope (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -4854,11 +4943,11 @@ check_phase_6_telescope_literal_acceptance_telescope_find_files() {
     -c 'Telescope find_files' -c 'qall!' 2>&1)"
   set -e
 
-  if ! grep -v -iE 'error|E[0-9]+:' <<<"$output" >/dev/null; then
+  if ! grep -v -iE 'error|E[0-9]+:' <<<"${output//$'\r'/}" >/dev/null; then
     printf 'phase 6 telescope: literal acceptance ":Telescope find_files" produced only error-tagged output (output: %s)\n' "$output" >&2
     return 1
   fi
-  if grep -Eq 'E[0-9]+:' <<<"$output"; then
+  if grep -Eq 'E[0-9]+:' <<<"${output//$'\r'/}"; then
     printf 'phase 6 telescope: literal acceptance ":Telescope find_files" raised a Neovim E<num>: error (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -4886,7 +4975,7 @@ check_phase_6_telescope_literal_acceptance_require_returns_table() {
     -c 'lua package.loaded.telescope = { setup = function(_) end }' \
     -c "lua print(type(require('telescope')))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q 'table' <<<"$output"; then
+  if ! grep -q 'table' <<<"${output//$'\r'/}"; then
     printf 'phase 6 telescope: literal acceptance print(type(require("telescope"))) did not emit "table" (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -4910,7 +4999,7 @@ check_phase_6_telescope_toggle_drops_telescope_specifically() {
   baseline_out="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua local has = false; for _, p in pairs(require('lazy.core.config').plugins) do if (p[1] == 'nvim-telescope/telescope.nvim') or (p.url and p.url:match('nvim%-telescope/telescope%.nvim')) then has = true; break end end; print('TS=' .. tostring(has))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^TS=true$' <<<"$baseline_out"; then
+  if ! grep -Eq '^TS=true$' <<<"${baseline_out//$'\r'/}"; then
     printf 'phase 6 telescope toggle: nvim-telescope/telescope.nvim not present in Config.plugins under baseline (output: %s)\n' "$baseline_out" >&2
     return 1
   fi
@@ -4920,7 +5009,7 @@ check_phase_6_telescope_toggle_drops_telescope_specifically() {
   toggled_out="$(LUNAVIM_CONFIG_DIR="$toggle_cfg" nvim --headless -u init.lua \
     -c "lua local has = false; for _, p in pairs(require('lazy.core.config').plugins) do if (p[1] == 'nvim-telescope/telescope.nvim') or (p.url and p.url:match('nvim%-telescope/telescope%.nvim')) then has = true; break end end; print('TS=' .. tostring(has))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^TS=false$' <<<"$toggled_out"; then
+  if ! grep -Eq '^TS=false$' <<<"${toggled_out//$'\r'/}"; then
     printf 'phase 6 telescope toggle: nvim-telescope/telescope.nvim still present in Config.plugins with telescope.active=false (output: %s)\n' "$toggled_out" >&2
     return 1
   fi
@@ -4958,7 +5047,7 @@ check_phase_6_lualine_defaults_shape() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua local t = lvim.builtin.lualine; print(t.active, type(t.options), t.options.theme, t.options.section_separators, t.options.component_separators, type(t.sections), type(t.sections.lualine_a), type(t.sections.lualine_b), type(t.sections.lualine_c), type(t.sections.lualine_x), type(t.sections.lualine_y), type(t.sections.lualine_z))' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^true[[:space:]]+table[[:space:]]+auto[[:space:]]+[[:space:]]+[[:space:]]+table[[:space:]]+table[[:space:]]+table[[:space:]]+table[[:space:]]+table[[:space:]]+table[[:space:]]+table$' <<<"$output"; then
+  if ! grep -Eq '^true[[:space:]]+table[[:space:]]+auto[[:space:]]+[[:space:]]+[[:space:]]+table[[:space:]]+table[[:space:]]+table[[:space:]]+table[[:space:]]+table[[:space:]]+table[[:space:]]+table$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 lualine: lvim.builtin.lualine defaults shape wrong (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -4978,7 +5067,7 @@ check_phase_6_lualine_defaults_section_components() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua local s = lvim.builtin.lualine.sections; print("SECT", s.lualine_a[1], s.lualine_b[1], s.lualine_c[1], s.lualine_x[1], s.lualine_y[1], s.lualine_z[1])' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^SECT[[:space:]]+mode[[:space:]]+branch[[:space:]]+diagnostics[[:space:]]+lsp_status[[:space:]]+progress[[:space:]]+location$' <<<"$output"; then
+  if ! grep -Eq '^SECT[[:space:]]+mode[[:space:]]+branch[[:space:]]+diagnostics[[:space:]]+lsp_status[[:space:]]+progress[[:space:]]+location$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 lualine: section components misaligned (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5001,7 +5090,7 @@ check_phase_6_lualine_setup_forwards_opts() {
     -c "lua require('lvim.plugins.modules.lualine').setup({})" \
     -c 'lua local o = _G.__ll_opts or {}; print("CAPTURED", type(o), type(o.options), o.options and o.options.theme, type(o.sections), o.sections and o.sections.lualine_a and o.sections.lualine_a[1], o.active == nil)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^CAPTURED[[:space:]]+table[[:space:]]+table[[:space:]]+auto[[:space:]]+table[[:space:]]+mode[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^CAPTURED[[:space:]]+table[[:space:]]+table[[:space:]]+auto[[:space:]]+table[[:space:]]+mode[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 lualine: module did not forward lvim.builtin.lualine (minus active) to lualine.setup (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5019,7 +5108,7 @@ check_phase_6_lualine_setup_pcall_guards_missing() {
     -c 'lua package.loaded.lualine = nil; package.preload.lualine = nil' \
     -c "lua local ok, err = pcall(function() require('lvim.plugins.modules.lualine').setup({}) end); print('PCALL', ok, err == nil)" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^PCALL[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^PCALL[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 lualine: module setup raised when lualine was unavailable (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5046,7 +5135,7 @@ LUA
     -c "lua require('lvim.plugins.modules.lualine').setup({})" \
     -c 'lua local o = _G.__ll_user_opts or {}; print("USER_LL", o.options and o.options.theme, o.options and o.options.globalstatus, o.active == nil)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^USER_LL[[:space:]]+gruvbox[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^USER_LL[[:space:]]+gruvbox[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 lualine: user override of lvim.builtin.lualine did not flow through to lualine.setup (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5075,7 +5164,7 @@ check_phase_6_lualine_setup_does_not_mutate_builtin() {
     -c "lua require('lvim.plugins.modules.lualine').setup({})" \
     -c 'lua local t = lvim.builtin.lualine; print("LIVE_LL", t.active, t.options.theme, t.sections.lualine_b[1])' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^LIVE_LL[[:space:]]+true[[:space:]]+auto[[:space:]]+branch$' <<<"$output"; then
+  if ! grep -Eq '^LIVE_LL[[:space:]]+true[[:space:]]+auto[[:space:]]+branch$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 lualine: lualine.setup observably mutated lvim.builtin.lualine (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5099,7 +5188,7 @@ check_phase_6_lualine_literal_acceptance_require_returns_table() {
     -c 'lua package.loaded.lualine = { setup = function(_) end }' \
     -c "lua print(type(require('lualine')))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q 'table' <<<"$output"; then
+  if ! grep -q 'table' <<<"${output//$'\r'/}"; then
     printf 'phase 6 lualine: literal acceptance print(type(require("lualine"))) did not emit "table" (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5120,7 +5209,7 @@ check_phase_6_lualine_defaults_lualine_x_full_list() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua local x = lvim.builtin.lualine.sections.lualine_x; print("LX", #x, x[1], x[2], x[3], x[4])' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^LX[[:space:]]+4[[:space:]]+lsp_status[[:space:]]+encoding[[:space:]]+fileformat[[:space:]]+filetype$' <<<"$output"; then
+  if ! grep -Eq '^LX[[:space:]]+4[[:space:]]+lsp_status[[:space:]]+encoding[[:space:]]+fileformat[[:space:]]+filetype$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 lualine: lualine_x defaults list incomplete or reordered (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5145,7 +5234,7 @@ check_phase_6_lualine_toggle_drops_lualine_specifically() {
   baseline_out="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua local has = false; for _, p in pairs(require('lazy.core.config').plugins) do if (p[1] == 'nvim-lualine/lualine.nvim') or (p.url and p.url:match('nvim%-lualine/lualine%.nvim')) then has = true; break end end; print('LL=' .. tostring(has))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^LL=true$' <<<"$baseline_out"; then
+  if ! grep -Eq '^LL=true$' <<<"${baseline_out//$'\r'/}"; then
     printf 'phase 6 lualine toggle: nvim-lualine/lualine.nvim not present in Config.plugins under baseline (output: %s)\n' "$baseline_out" >&2
     return 1
   fi
@@ -5155,7 +5244,7 @@ check_phase_6_lualine_toggle_drops_lualine_specifically() {
   toggled_out="$(LUNAVIM_CONFIG_DIR="$toggle_cfg" nvim --headless -u init.lua \
     -c "lua local has = false; for _, p in pairs(require('lazy.core.config').plugins) do if (p[1] == 'nvim-lualine/lualine.nvim') or (p.url and p.url:match('nvim%-lualine/lualine%.nvim')) then has = true; break end end; print('LL=' .. tostring(has))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^LL=false$' <<<"$toggled_out"; then
+  if ! grep -Eq '^LL=false$' <<<"${toggled_out//$'\r'/}"; then
     printf 'phase 6 lualine toggle: nvim-lualine/lualine.nvim still present in Config.plugins with lualine.active=false (output: %s)\n' "$toggled_out" >&2
     return 1
   fi
@@ -5192,7 +5281,7 @@ check_phase_6_bufferline_defaults_shape() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua local t = lvim.builtin.bufferline; print(t.active, type(t.options), t.options.diagnostics, type(t.options.offsets), type(t.options.offsets[1]))' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^true[[:space:]]+table[[:space:]]+nvim_lsp[[:space:]]+table[[:space:]]+table$' <<<"$output"; then
+  if ! grep -Eq '^true[[:space:]]+table[[:space:]]+nvim_lsp[[:space:]]+table[[:space:]]+table$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 bufferline: lvim.builtin.bufferline defaults shape wrong (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5212,7 +5301,7 @@ check_phase_6_bufferline_defaults_offsets_nvimtree() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua local o = lvim.builtin.bufferline.options.offsets[1]; print("OFF", o.filetype, o.text, o.highlight, o.text_align)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^OFF[[:space:]]+NvimTree[[:space:]]+File Explorer[[:space:]]+Directory[[:space:]]+left$' <<<"$output"; then
+  if ! grep -Eq '^OFF[[:space:]]+NvimTree[[:space:]]+File Explorer[[:space:]]+Directory[[:space:]]+left$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 bufferline: offsets[1] entry misaligned (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5235,7 +5324,7 @@ check_phase_6_bufferline_setup_forwards_opts() {
     -c "lua require('lvim.plugins.modules.bufferline').setup({})" \
     -c 'lua local o = _G.__bl_opts or {}; print("CAPTURED_BL", type(o), type(o.options), o.options and o.options.diagnostics, o.options and o.options.offsets and o.options.offsets[1] and o.options.offsets[1].filetype, o.active == nil)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^CAPTURED_BL[[:space:]]+table[[:space:]]+table[[:space:]]+nvim_lsp[[:space:]]+NvimTree[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^CAPTURED_BL[[:space:]]+table[[:space:]]+table[[:space:]]+nvim_lsp[[:space:]]+NvimTree[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 bufferline: module did not forward lvim.builtin.bufferline (minus active) to bufferline.setup (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5253,7 +5342,7 @@ check_phase_6_bufferline_setup_pcall_guards_missing() {
     -c 'lua package.loaded.bufferline = nil; package.preload.bufferline = nil' \
     -c "lua local ok, err = pcall(function() require('lvim.plugins.modules.bufferline').setup({}) end); print('PCALL_BL', ok, err == nil)" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^PCALL_BL[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^PCALL_BL[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 bufferline: module setup raised when bufferline was unavailable (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5280,7 +5369,7 @@ LUA
     -c "lua require('lvim.plugins.modules.bufferline').setup({})" \
     -c 'lua local o = _G.__bl_user_opts or {}; print("USER_BL", o.options and tostring(o.options.diagnostics), o.options and tostring(o.options.always_show_bufferline), o.active == nil)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^USER_BL[[:space:]]+false[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^USER_BL[[:space:]]+false[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 bufferline: user override of lvim.builtin.bufferline did not flow through to bufferline.setup (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5310,7 +5399,7 @@ check_phase_6_bufferline_setup_does_not_mutate_builtin() {
     -c "lua require('lvim.plugins.modules.bufferline').setup({})" \
     -c 'lua local t = lvim.builtin.bufferline; print("LIVE_BL", t.active, t.options.diagnostics, t.options.offsets[1].filetype)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^LIVE_BL[[:space:]]+true[[:space:]]+nvim_lsp[[:space:]]+NvimTree$' <<<"$output"; then
+  if ! grep -Eq '^LIVE_BL[[:space:]]+true[[:space:]]+nvim_lsp[[:space:]]+NvimTree$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 bufferline: bufferline.setup observably mutated lvim.builtin.bufferline (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5334,7 +5423,7 @@ check_phase_6_bufferline_literal_acceptance_require_returns_table() {
     -c 'lua package.loaded.bufferline = { setup = function(_) end }' \
     -c "lua print(type(require('bufferline')))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q 'table' <<<"$output"; then
+  if ! grep -q 'table' <<<"${output//$'\r'/}"; then
     printf 'phase 6 bufferline: literal acceptance print(type(require("bufferline"))) did not emit "table" (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5359,7 +5448,7 @@ check_phase_6_bufferline_toggle_drops_bufferline_specifically() {
   baseline_out="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua local has = false; for _, p in pairs(require('lazy.core.config').plugins) do if (p[1] == 'akinsho/bufferline.nvim') or (p.url and p.url:match('akinsho/bufferline%.nvim')) then has = true; break end end; print('BL=' .. tostring(has))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^BL=true$' <<<"$baseline_out"; then
+  if ! grep -Eq '^BL=true$' <<<"${baseline_out//$'\r'/}"; then
     printf 'phase 6 bufferline toggle: akinsho/bufferline.nvim not present in Config.plugins under baseline (output: %s)\n' "$baseline_out" >&2
     return 1
   fi
@@ -5369,7 +5458,7 @@ check_phase_6_bufferline_toggle_drops_bufferline_specifically() {
   toggled_out="$(LUNAVIM_CONFIG_DIR="$toggle_cfg" nvim --headless -u init.lua \
     -c "lua local has = false; for _, p in pairs(require('lazy.core.config').plugins) do if (p[1] == 'akinsho/bufferline.nvim') or (p.url and p.url:match('akinsho/bufferline%.nvim')) then has = true; break end end; print('BL=' .. tostring(has))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^BL=false$' <<<"$toggled_out"; then
+  if ! grep -Eq '^BL=false$' <<<"${toggled_out//$'\r'/}"; then
     printf 'phase 6 bufferline toggle: akinsho/bufferline.nvim still present in Config.plugins with bufferline.active=false (output: %s)\n' "$toggled_out" >&2
     return 1
   fi
@@ -5392,7 +5481,7 @@ check_phase_6_bufferline_defaults_offsets_full_list() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua local o = lvim.builtin.bufferline.options.offsets; print("OFFLEN", #o, o[1].filetype, o[1].text, o[1].highlight, o[1].text_align)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^OFFLEN[[:space:]]+1[[:space:]]+NvimTree[[:space:]]+File Explorer[[:space:]]+Directory[[:space:]]+left$' <<<"$output"; then
+  if ! grep -Eq '^OFFLEN[[:space:]]+1[[:space:]]+NvimTree[[:space:]]+File Explorer[[:space:]]+Directory[[:space:]]+left$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 bufferline: offsets list length or contents misaligned (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5429,7 +5518,7 @@ check_phase_6_gitsigns_defaults_shape() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua local t = lvim.builtin.gitsigns; print(t.active, type(t.signs), type(t.signs_staged), t.signcolumn, t.attach_to_untracked, t.current_line_blame, type(t.current_line_blame_opts), type(t.watch_gitdir), type(t.preview_config))' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^true[[:space:]]+table[[:space:]]+table[[:space:]]+true[[:space:]]+true[[:space:]]+false[[:space:]]+table[[:space:]]+table[[:space:]]+table$' <<<"$output"; then
+  if ! grep -Eq '^true[[:space:]]+table[[:space:]]+table[[:space:]]+true[[:space:]]+true[[:space:]]+false[[:space:]]+table[[:space:]]+table[[:space:]]+table$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 gitsigns: lvim.builtin.gitsigns defaults shape wrong (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5449,7 +5538,7 @@ check_phase_6_gitsigns_defaults_signs_per_status() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua local s = lvim.builtin.gitsigns.signs; print("SIGNS", s.add and s.add.text, s.change and s.change.text, s.delete and s.delete.text, s.topdelete and s.topdelete.text, s.changedelete and s.changedelete.text, s.untracked and s.untracked.text)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^SIGNS[[:space:]]+┃[[:space:]]+┃[[:space:]]+_[[:space:]]+‾[[:space:]]+~[[:space:]]+┆$' <<<"$output"; then
+  if ! grep -Eq '^SIGNS[[:space:]]+┃[[:space:]]+┃[[:space:]]+_[[:space:]]+‾[[:space:]]+~[[:space:]]+┆$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 gitsigns: signs per-status shape misaligned (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5472,7 +5561,7 @@ check_phase_6_gitsigns_setup_forwards_opts() {
     -c "lua require('lvim.plugins.modules.gitsigns').setup({})" \
     -c 'lua local o = _G.__gs_opts or {}; print("CAPTURED_GS", type(o), type(o.signs), o.signs and o.signs.add and o.signs.add.text, o.signcolumn, o.attach_to_untracked, o.active == nil)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^CAPTURED_GS[[:space:]]+table[[:space:]]+table[[:space:]]+┃[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^CAPTURED_GS[[:space:]]+table[[:space:]]+table[[:space:]]+┃[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 gitsigns: module did not forward lvim.builtin.gitsigns (minus active) to gitsigns.setup (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5490,7 +5579,7 @@ check_phase_6_gitsigns_setup_pcall_guards_missing() {
     -c 'lua package.loaded.gitsigns = nil; package.preload.gitsigns = nil' \
     -c "lua local ok, err = pcall(function() require('lvim.plugins.modules.gitsigns').setup({}) end); print('PCALL_GS', ok, err == nil)" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^PCALL_GS[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^PCALL_GS[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 gitsigns: module setup raised when gitsigns was unavailable (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5517,7 +5606,7 @@ LUA
     -c "lua require('lvim.plugins.modules.gitsigns').setup({})" \
     -c 'lua local o = _G.__gs_user_opts or {}; print("USER_GS", o.signs and o.signs.add and o.signs.add.text, o.signs and o.signs.add and tostring(o.signs.add.show_count), tostring(o.current_line_blame), o.signs and o.signs.change and o.signs.change.text, o.active == nil)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^USER_GS[[:space:]]+X[[:space:]]+true[[:space:]]+true[[:space:]]+┃[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^USER_GS[[:space:]]+X[[:space:]]+true[[:space:]]+true[[:space:]]+┃[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 gitsigns: user override of lvim.builtin.gitsigns did not flow through to gitsigns.setup (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5548,7 +5637,7 @@ check_phase_6_gitsigns_setup_does_not_mutate_builtin() {
     -c "lua require('lvim.plugins.modules.gitsigns').setup({})" \
     -c 'lua local t = lvim.builtin.gitsigns; print("LIVE_GS", t.active, t.signs.add.text, tostring(t.current_line_blame_opts.virt_text))' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^LIVE_GS[[:space:]]+true[[:space:]]+┃[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^LIVE_GS[[:space:]]+true[[:space:]]+┃[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 gitsigns: gitsigns.setup observably mutated lvim.builtin.gitsigns (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5568,7 +5657,7 @@ check_phase_6_gitsigns_leader_g_group_maps_registered() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua local function has(lhs) for _, m in ipairs(vim.api.nvim_get_keymap("n")) do if m.lhs == lhs then return true end end return false end; print("GMAPS", has(" gj"), has(" gk"), has(" gp"), has(" gb"))' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^GMAPS[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^GMAPS[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 gitsigns: <leader>g{j,k,p,b} not all registered (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5592,7 +5681,7 @@ check_phase_6_gitsigns_literal_acceptance_require_returns_table() {
     -c 'lua package.loaded.gitsigns = { setup = function(_) end }' \
     -c "lua print(type(require('gitsigns')))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q 'table' <<<"$output"; then
+  if ! grep -q 'table' <<<"${output//$'\r'/}"; then
     printf 'phase 6 gitsigns: literal acceptance print(type(require("gitsigns"))) did not emit "table" (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5617,7 +5706,7 @@ check_phase_6_gitsigns_toggle_drops_gitsigns_specifically() {
   baseline_out="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua local has = false; for _, p in pairs(require('lazy.core.config').plugins) do if (p[1] == 'lewis6991/gitsigns.nvim') or (p.url and p.url:match('lewis6991/gitsigns%.nvim')) then has = true; break end end; print('GS=' .. tostring(has))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^GS=true$' <<<"$baseline_out"; then
+  if ! grep -Eq '^GS=true$' <<<"${baseline_out//$'\r'/}"; then
     printf 'phase 6 gitsigns toggle: lewis6991/gitsigns.nvim not present in Config.plugins under baseline (output: %s)\n' "$baseline_out" >&2
     return 1
   fi
@@ -5627,7 +5716,7 @@ check_phase_6_gitsigns_toggle_drops_gitsigns_specifically() {
   toggled_out="$(LUNAVIM_CONFIG_DIR="$toggle_cfg" nvim --headless -u init.lua \
     -c "lua local has = false; for _, p in pairs(require('lazy.core.config').plugins) do if (p[1] == 'lewis6991/gitsigns.nvim') or (p.url and p.url:match('lewis6991/gitsigns%.nvim')) then has = true; break end end; print('GS=' .. tostring(has))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^GS=false$' <<<"$toggled_out"; then
+  if ! grep -Eq '^GS=false$' <<<"${toggled_out//$'\r'/}"; then
     printf 'phase 6 gitsigns toggle: lewis6991/gitsigns.nvim still present in Config.plugins with gitsigns.active=false (output: %s)\n' "$toggled_out" >&2
     return 1
   fi
@@ -5651,7 +5740,7 @@ check_phase_6_gitsigns_defaults_signs_staged_per_status() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua local s = lvim.builtin.gitsigns.signs_staged; print("SIGNS_STAGED", s.add and s.add.text, s.change and s.change.text, s.delete and s.delete.text, s.topdelete and s.topdelete.text, s.changedelete and s.changedelete.text, s.untracked and s.untracked.text)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^SIGNS_STAGED[[:space:]]+┃[[:space:]]+┃[[:space:]]+_[[:space:]]+‾[[:space:]]+~[[:space:]]+┆$' <<<"$output"; then
+  if ! grep -Eq '^SIGNS_STAGED[[:space:]]+┃[[:space:]]+┃[[:space:]]+_[[:space:]]+‾[[:space:]]+~[[:space:]]+┆$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 gitsigns: signs_staged per-status shape misaligned (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5699,7 +5788,7 @@ check_phase_6_whichkey_defaults_shape() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua local t = lvim.builtin.whichkey; print(t.active, type(t.setup), type(t.mappings), #t.mappings)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^true[[:space:]]+table[[:space:]]+table[[:space:]]+[1-9][0-9]*$' <<<"$output"; then
+  if ! grep -Eq '^true[[:space:]]+table[[:space:]]+table[[:space:]]+[1-9][0-9]*$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 whichkey: lvim.builtin.whichkey defaults shape wrong (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5736,7 +5825,7 @@ check_phase_6_whichkey_defaults_leader_groups() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua local m = lvim.builtin.whichkey.mappings; local groups, direct = {}, {}; for _, e in ipairs(m) do if type(e) == "table" and e[1] then if e.group then groups[e[1]] = e.group else direct[e[1]] = e[2] end end end; local find_ok = type(direct["<leader>f"]) == "string" and direct["<leader>f"]:find("find_files", 1, true) ~= nil; print("GROUPS", groups["<leader>b"], groups["<leader>g"], groups["<leader>l"], groups["<leader>s"], groups["<leader>p"], find_ok)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^GROUPS[[:space:]]+Buffers[[:space:]]+Git[[:space:]]+LSP[[:space:]]+Search[[:space:]]+Plugins[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^GROUPS[[:space:]]+Buffers[[:space:]]+Git[[:space:]]+LSP[[:space:]]+Search[[:space:]]+Plugins[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 whichkey: six prescribed leader-group labels not all seeded in lvim.builtin.whichkey.mappings (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5769,7 +5858,7 @@ check_phase_6_whichkey_setup_forwards_opts() {
   # wrong shape here because the module filters entries at runtime: the lazygit
   # binding drops out when the `lazygit` executable is absent, so the length
   # legitimately differs between machines.
-  if ! grep -Eq '^CAPTURED_WK[[:space:]]+table[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^CAPTURED_WK[[:space:]]+table[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 whichkey: module did not forward lvim.builtin.whichkey.setup/mappings to which-key.setup/add (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5787,7 +5876,7 @@ check_phase_6_whichkey_setup_pcall_guards_missing() {
     -c 'lua package.loaded["which-key"] = nil; package.preload["which-key"] = nil' \
     -c "lua local ok, err = pcall(function() require('lvim.plugins.modules.whichkey').setup({}) end); print('PCALL_WK', ok, err == nil)" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^PCALL_WK[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^PCALL_WK[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 whichkey: module setup raised when which-key was unavailable (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5820,7 +5909,7 @@ LUA
   # length varies by machine. The user's appended `<leader>x` group is the assertion that
   # actually matters — it also pins that a group with no child bindings
   # survives filtering, which is user config the filter used to discard.
-  if ! grep -Eq '^USER_WK[[:space:]]+modern[[:space:]]+true[[:space:]]+\+extra$' <<<"$output"; then
+  if ! grep -Eq '^USER_WK[[:space:]]+modern[[:space:]]+true[[:space:]]+\+extra$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 whichkey: user override of lvim.builtin.whichkey did not flow through to which-key.setup/add (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5857,7 +5946,7 @@ check_phase_6_whichkey_setup_does_not_mutate_builtin() {
     -c "lua require('lvim.plugins.modules.whichkey').setup({})" \
     -c 'lua local t = lvim.builtin.whichkey; local b = _G.__before; print("LIVE_WK", t.active, tostring(t.setup.preset) == b.preset, t.mappings[1][1] == b.lhs, tostring(t.mappings[1].group) == b.group)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^LIVE_WK[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^LIVE_WK[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 whichkey: which-key.setup/add observably mutated lvim.builtin.whichkey (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5881,7 +5970,7 @@ check_phase_6_whichkey_literal_acceptance_require_returns_table() {
     -c 'lua package.loaded["which-key"] = { setup = function(_) end, add = function(_) end }' \
     -c "lua print(type(require('which-key')))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q 'table' <<<"$output"; then
+  if ! grep -q 'table' <<<"${output//$'\r'/}"; then
     printf 'phase 6 whichkey: literal acceptance print(type(require("which-key"))) did not emit "table" (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5906,7 +5995,7 @@ check_phase_6_whichkey_toggle_drops_whichkey_specifically() {
   baseline_out="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua local has = false; for _, p in pairs(require('lazy.core.config').plugins) do if (p[1] == 'folke/which-key.nvim') or (p.url and p.url:match('folke/which%-key%.nvim')) then has = true; break end end; print('WK=' .. tostring(has))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^WK=true$' <<<"$baseline_out"; then
+  if ! grep -Eq '^WK=true$' <<<"${baseline_out//$'\r'/}"; then
     printf 'phase 6 whichkey toggle: folke/which-key.nvim not present in Config.plugins under baseline (output: %s)\n' "$baseline_out" >&2
     return 1
   fi
@@ -5916,7 +6005,7 @@ check_phase_6_whichkey_toggle_drops_whichkey_specifically() {
   toggled_out="$(LUNAVIM_CONFIG_DIR="$toggle_cfg" nvim --headless -u init.lua \
     -c "lua local has = false; for _, p in pairs(require('lazy.core.config').plugins) do if (p[1] == 'folke/which-key.nvim') or (p.url and p.url:match('folke/which%-key%.nvim')) then has = true; break end end; print('WK=' .. tostring(has))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^WK=false$' <<<"$toggled_out"; then
+  if ! grep -Eq '^WK=false$' <<<"${toggled_out//$'\r'/}"; then
     printf 'phase 6 whichkey toggle: folke/which-key.nvim still present in Config.plugins with whichkey.active=false (output: %s)\n' "$toggled_out" >&2
     return 1
   fi
@@ -5948,7 +6037,7 @@ check_phase_6_whichkey_defaults_mappings_full_list() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua local m = lvim.builtin.whichkey.mappings; local seen, dupes, malformed = {}, {}, {}; for _, e in ipairs(m) do local lhs = type(e) == "table" and e[1] or nil; if type(lhs) ~= "string" then malformed[#malformed + 1] = tostring(lhs) elseif e.group == nil and e[2] == nil then malformed[#malformed + 1] = lhs elseif seen[lhs] then dupes[#dupes + 1] = lhs else seen[lhs] = true end end; print("WK_MAPS", #m >= 20, #dupes, #malformed, table.concat(dupes, ","), table.concat(malformed, ","))' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^WK_MAPS[[:space:]]+true[[:space:]]+0[[:space:]]+0[[:space:]]*$' <<<"$output"; then
+  if ! grep -Eq '^WK_MAPS[[:space:]]+true[[:space:]]+0[[:space:]]+0[[:space:]]*$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 whichkey: mappings list has duplicate or malformed entries (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -5993,7 +6082,7 @@ check_phase_6_terminal_defaults_shape() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua local t = lvim.builtin.terminal; print(t.active, t.size, t.open_mapping, t.direction, t.shading_factor, type(t.float_opts) == "table" and t.float_opts.border or "MISSING")' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^true[[:space:]]+20[[:space:]]+<c-\\>[[:space:]]+float[[:space:]]+2[[:space:]]+curved$' <<<"$output"; then
+  if ! grep -Eq '^true[[:space:]]+20[[:space:]]+<c-\\>[[:space:]]+float[[:space:]]+2[[:space:]]+curved$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 terminal: lvim.builtin.terminal defaults shape wrong (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6016,7 +6105,7 @@ check_phase_6_terminal_setup_forwards_opts() {
     -c "lua require('lvim.plugins.modules.terminal').setup({})" \
     -c 'lua local o = _G.__tt_opts or {}; print("CAPTURED_TT", type(o), o.size, o.open_mapping, o.direction, o.shading_factor, o.active == nil)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^CAPTURED_TT[[:space:]]+table[[:space:]]+20[[:space:]]+<c-\\>[[:space:]]+float[[:space:]]+2[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^CAPTURED_TT[[:space:]]+table[[:space:]]+20[[:space:]]+<c-\\>[[:space:]]+float[[:space:]]+2[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 terminal: module did not forward lvim.builtin.terminal (minus active) to toggleterm.setup (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6037,7 +6126,7 @@ check_phase_6_terminal_setup_pcall_guards_missing() {
     -c 'lua package.loaded.toggleterm = nil; package.preload.toggleterm = nil' \
     -c "lua local ok, err = pcall(function() require('lvim.plugins.modules.terminal').setup({}) end); print('PCALL_TT', ok, err == nil)" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^PCALL_TT[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^PCALL_TT[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 terminal: module setup raised when toggleterm was unavailable (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6064,7 +6153,7 @@ LUA
     -c "lua require('lvim.plugins.modules.terminal').setup({})" \
     -c 'lua local o = _G.__tt_user_opts or {}; print("USER_TT", o.direction, o.size, tostring(o.start_in_insert), o.active == nil)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^USER_TT[[:space:]]+float[[:space:]]+30[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^USER_TT[[:space:]]+float[[:space:]]+30[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 terminal: user override of lvim.builtin.terminal did not flow through to toggleterm.setup (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6093,7 +6182,7 @@ check_phase_6_terminal_setup_does_not_mutate_builtin() {
     -c "lua require('lvim.plugins.modules.terminal').setup({})" \
     -c 'lua local t = lvim.builtin.terminal; print("LIVE_TT", t.active, t.direction, t.size)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^LIVE_TT[[:space:]]+true[[:space:]]+float[[:space:]]+20$' <<<"$output"; then
+  if ! grep -Eq '^LIVE_TT[[:space:]]+true[[:space:]]+float[[:space:]]+20$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 terminal: toggleterm.setup observably mutated lvim.builtin.terminal (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6115,7 +6204,7 @@ check_phase_6_terminal_lazygit_gated_on_executable() {
     -u init.lua \
     -c 'lua local function has(lhs) for _, m in ipairs(vim.api.nvim_get_keymap("n")) do if m.lhs == lhs then return true end end return false end; print("LAZYGIT_ON", has(" gg"))' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^LAZYGIT_ON[[:space:]]+true$' <<<"$output_present"; then
+  if ! grep -Eq '^LAZYGIT_ON[[:space:]]+true$' <<<"${output_present//$'\r'/}"; then
     printf 'phase 6 terminal: <leader>gg not registered when lazygit is on PATH (output: %s)\n' "$output_present" >&2
     return 1
   fi
@@ -6125,7 +6214,7 @@ check_phase_6_terminal_lazygit_gated_on_executable() {
     -u init.lua \
     -c 'lua local function has(lhs) for _, m in ipairs(vim.api.nvim_get_keymap("n")) do if m.lhs == lhs then return true end end return false end; print("LAZYGIT_OFF", has(" gg"))' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^LAZYGIT_OFF[[:space:]]+false$' <<<"$output_absent"; then
+  if ! grep -Eq '^LAZYGIT_OFF[[:space:]]+false$' <<<"${output_absent//$'\r'/}"; then
     printf 'phase 6 terminal: <leader>gg registered as phantom mapping when lazygit is NOT on PATH (output: %s)\n' "$output_absent" >&2
     return 1
   fi
@@ -6149,7 +6238,7 @@ check_phase_6_terminal_toggle_lazygit_caches_terminal() {
     -c "lua require('lvim.plugins.modules.terminal').toggle_lazygit()" \
     -c 'lua print("LG_CACHE", _G.__lg_new_calls, _G.__lg_toggle_calls, _G.__lg_last_opts and _G.__lg_last_opts.cmd, _G.__lg_last_opts and _G.__lg_last_opts.direction)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^LG_CACHE[[:space:]]+1[[:space:]]+2[[:space:]]+lazygit[[:space:]]+float$' <<<"$output"; then
+  if ! grep -Eq '^LG_CACHE[[:space:]]+1[[:space:]]+2[[:space:]]+lazygit[[:space:]]+float$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 terminal: toggle_lazygit did not cache a single Terminal:new instance (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6168,7 +6257,7 @@ check_phase_6_terminal_toggle_lazygit_pcall_guards_missing() {
     -c 'lua package.loaded["toggleterm.terminal"] = nil; package.preload["toggleterm.terminal"] = nil' \
     -c "lua local ok, err = pcall(function() require('lvim.plugins.modules.terminal').toggle_lazygit() end); print('PCALL_LG', ok, err == nil)" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^PCALL_LG[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^PCALL_LG[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 terminal: toggle_lazygit raised when toggleterm.terminal was unavailable (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6192,7 +6281,7 @@ check_phase_6_terminal_literal_acceptance_require_returns_table() {
     -c 'lua package.loaded.toggleterm = { setup = function(_) end }' \
     -c "lua print(type(require('toggleterm')))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q 'table' <<<"$output"; then
+  if ! grep -q 'table' <<<"${output//$'\r'/}"; then
     printf 'phase 6 terminal: literal acceptance print(type(require("toggleterm"))) did not emit "table" (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6217,7 +6306,7 @@ check_phase_6_terminal_toggle_drops_terminal_specifically() {
   baseline_out="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua local has = false; for _, p in pairs(require('lazy.core.config').plugins) do if (p[1] == 'akinsho/toggleterm.nvim') or (p.url and p.url:match('akinsho/toggleterm%.nvim')) then has = true; break end end; print('TT=' .. tostring(has))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^TT=true$' <<<"$baseline_out"; then
+  if ! grep -Eq '^TT=true$' <<<"${baseline_out//$'\r'/}"; then
     printf 'phase 6 terminal toggle: akinsho/toggleterm.nvim not present in Config.plugins under baseline (output: %s)\n' "$baseline_out" >&2
     return 1
   fi
@@ -6227,7 +6316,7 @@ check_phase_6_terminal_toggle_drops_terminal_specifically() {
   toggled_out="$(LUNAVIM_CONFIG_DIR="$toggle_cfg" nvim --headless -u init.lua \
     -c "lua local has = false; for _, p in pairs(require('lazy.core.config').plugins) do if (p[1] == 'akinsho/toggleterm.nvim') or (p.url and p.url:match('akinsho/toggleterm%.nvim')) then has = true; break end end; print('TT=' .. tostring(has))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^TT=false$' <<<"$toggled_out"; then
+  if ! grep -Eq '^TT=false$' <<<"${toggled_out//$'\r'/}"; then
     printf 'phase 6 terminal toggle: akinsho/toggleterm.nvim still present in Config.plugins with terminal.active=false (output: %s)\n' "$toggled_out" >&2
     return 1
   fi
@@ -6252,7 +6341,7 @@ check_phase_6_terminal_lazygit_map_rhs_calls_toggle_lazygit() {
     -u init.lua \
     -c "lua local rhs = vim.fn.maparg('<leader>gg', 'n'); print('LG_RHS=' .. rhs)" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq "^LG_RHS=.*lvim\\.plugins\\.modules\\.terminal.*toggle_lazygit" <<<"$output"; then
+  if ! grep -Eq "^LG_RHS=.*lvim\\.plugins\\.modules\\.terminal.*toggle_lazygit" <<<"${output//$'\r'/}"; then
     printf 'phase 6 terminal: <leader>gg rhs does not invoke lvim.plugins.modules.terminal.toggle_lazygit (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6280,7 +6369,7 @@ check_phase_6_terminal_lazygit_recipe_opts_full_shape() {
     -c "lua require('lvim.plugins.modules.terminal').toggle_lazygit()" \
     -c 'lua local o = _G.__lg_opts or {}; local fo = o.float_opts or {}; print("LG_FULL", o.cmd, o.dir, o.direction, tostring(o.hidden), fo.border)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^LG_FULL[[:space:]]+lazygit[[:space:]]+git_dir[[:space:]]+float[[:space:]]+true[[:space:]]+double$' <<<"$output"; then
+  if ! grep -Eq '^LG_FULL[[:space:]]+lazygit[[:space:]]+git_dir[[:space:]]+float[[:space:]]+true[[:space:]]+double$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 terminal: toggle_lazygit Terminal:new opts shape mismatched the canonical lazygit recipe (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6303,7 +6392,7 @@ check_phase_6_comment_toggle_drops_plugin() {
   baseline_out="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua print('STATS=' .. require('lazy').stats().count)" \
     -c 'qall!' 2>&1)"
-  baseline_n="$(grep -Eo 'STATS=[0-9]+' <<<"$baseline_out" | head -1 | cut -d= -f2)"
+  baseline_n="$(grep -Eo 'STATS=[0-9]+' <<<"${baseline_out//$'\r'/}" | head -1 | cut -d= -f2)"
   if [[ -z "$baseline_n" ]]; then
     printf 'phase 6 comment toggle: could not read baseline STATS count (output: %s)\n' "$baseline_out" >&2
     return 1
@@ -6314,7 +6403,7 @@ check_phase_6_comment_toggle_drops_plugin() {
   toggled_out="$(LUNAVIM_CONFIG_DIR="$toggle_cfg" nvim --headless -u init.lua \
     -c "lua print('STATS=' .. require('lazy').stats().count)" \
     -c 'qall!' 2>&1)"
-  toggled_n="$(grep -Eo 'STATS=[0-9]+' <<<"$toggled_out" | head -1 | cut -d= -f2)"
+  toggled_n="$(grep -Eo 'STATS=[0-9]+' <<<"${toggled_out//$'\r'/}" | head -1 | cut -d= -f2)"
   if [[ -z "$toggled_n" ]]; then
     printf 'phase 6 comment toggle: could not read toggled STATS count (output: %s)\n' "$toggled_out" >&2
     return 1
@@ -6346,7 +6435,7 @@ check_phase_6_comment_toggle_drops_mini_nvim_specifically() {
   baseline_out="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua local has = false; for _, p in pairs(require('lazy.core.config').plugins) do if (p[1] == 'echasnovski/mini.nvim') or (p.url and p.url:match('echasnovski/mini%.nvim')) then has = true; break end end; print('MINI=' .. tostring(has))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^MINI=true$' <<<"$baseline_out"; then
+  if ! grep -Eq '^MINI=true$' <<<"${baseline_out//$'\r'/}"; then
     printf 'phase 6 comment toggle: echasnovski/mini.nvim not present in Config.plugins under baseline (output: %s)\n' "$baseline_out" >&2
     return 1
   fi
@@ -6356,7 +6445,7 @@ check_phase_6_comment_toggle_drops_mini_nvim_specifically() {
   toggled_out="$(LUNAVIM_CONFIG_DIR="$toggle_cfg" nvim --headless -u init.lua \
     -c "lua local has = false; for _, p in pairs(require('lazy.core.config').plugins) do if (p[1] == 'echasnovski/mini.nvim') or (p.url and p.url:match('echasnovski/mini%.nvim')) then has = true; break end end; print('MINI=' .. tostring(has))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^MINI=false$' <<<"$toggled_out"; then
+  if ! grep -Eq '^MINI=false$' <<<"${toggled_out//$'\r'/}"; then
     printf 'phase 6 comment toggle: echasnovski/mini.nvim still present in Config.plugins with comment.active=false (output: %s)\n' "$toggled_out" >&2
     return 1
   fi
@@ -6384,7 +6473,7 @@ LUA
     -c "lua require('lvim.plugins.modules.comment').setup({})" \
     -c 'lua local o = lvim.builtin.comment.options; print("LIVE_CMT", lvim.builtin.comment.active, tostring(o.ignore_blank_line), tostring(o.start_of_line))' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^LIVE_CMT[[:space:]]+true[[:space:]]+true[[:space:]]+false$' <<<"$output"; then
+  if ! grep -Eq '^LIVE_CMT[[:space:]]+true[[:space:]]+true[[:space:]]+false$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 comment: mini.comment.setup observably mutated lvim.builtin.comment.options (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6414,7 +6503,7 @@ check_phase_6_comment_literal_acceptance_require_returns_table() {
     -c 'lua package.loaded["mini.comment"] = { setup = function(_) end }' \
     -c "lua print(type(require('mini.comment')))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q 'table' <<<"$output"; then
+  if ! grep -q 'table' <<<"${output//$'\r'/}"; then
     printf 'phase 6 comment: literal acceptance print(type(require("mini.comment"))) did not emit "table" (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6451,7 +6540,7 @@ check_phase_6_comment_module_dispatches_through_mini_comment_require() {
     -c "lua require('lvim.plugins.modules.comment').setup({})" \
     -c 'lua print("MC_REQ=" .. tostring(_G.__MINI_COMMENT_REQUIRED) .. " MC_SETUP=" .. tostring(_G.__MINI_COMMENT_SETUP_CALLED))' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^MC_REQ=true MC_SETUP=true$' <<<"$output"; then
+  if ! grep -Eq '^MC_REQ=true MC_SETUP=true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 comment: comment.lua did not dispatch through require("mini.comment") and mini_comment.setup at runtime (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6493,7 +6582,7 @@ check_phase_6_breadcrumbs_defaults_shape() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua local t = lvim.builtin.breadcrumbs; print(t.active, type(t.options), type(t.options.icons), t.options.highlight)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^true[[:space:]]+table[[:space:]]+table[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^true[[:space:]]+table[[:space:]]+table[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 breadcrumbs: lvim.builtin.breadcrumbs defaults shape wrong (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6517,7 +6606,7 @@ check_phase_6_breadcrumbs_setup_forwards_opts() {
     -c "lua require('lvim.plugins.modules.breadcrumbs').setup({})" \
     -c 'lua local o = _G.__nv_opts or {}; print("CAPTURED_NV", type(o), o.highlight, o.active == nil)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^CAPTURED_NV[[:space:]]+table[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^CAPTURED_NV[[:space:]]+table[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 breadcrumbs: module did not forward lvim.builtin.breadcrumbs.options to nvim-navic.setup (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6537,7 +6626,7 @@ check_phase_6_breadcrumbs_setup_pcall_guards_missing() {
     -c 'lua package.loaded["nvim-navic"] = nil; package.preload["nvim-navic"] = nil' \
     -c "lua local ok, err = pcall(function() require('lvim.plugins.modules.breadcrumbs').setup({}) end); print('PCALL_NV', ok, err == nil)" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^PCALL_NV[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^PCALL_NV[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 breadcrumbs: module setup raised when nvim-navic was unavailable (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6560,7 +6649,7 @@ check_phase_6_breadcrumbs_setup_arms_winbar() {
     -c "lua require('lvim.plugins.modules.breadcrumbs').setup({})" \
     -c 'lua print("WINBAR=" .. vim.o.winbar)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq "^WINBAR=.*nvim-navic.*get_location" <<<"$output"; then
+  if ! grep -Eq "^WINBAR=.*nvim-navic.*get_location" <<<"${output//$'\r'/}"; then
     printf 'phase 6 breadcrumbs: vim.opt.winbar was not armed with the navic get_location expression after setup (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6583,7 +6672,7 @@ check_phase_6_breadcrumbs_setup_does_not_mutate_builtin() {
     -c "lua require('lvim.plugins.modules.breadcrumbs').setup({})" \
     -c 'lua local o = lvim.builtin.breadcrumbs.options; print("LIVE_NV", lvim.builtin.breadcrumbs.active, o.highlight)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^LIVE_NV[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^LIVE_NV[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 breadcrumbs: nvim-navic.setup observably mutated lvim.builtin.breadcrumbs.options (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6612,7 +6701,7 @@ LUA
     -c "lua require('lvim.plugins.modules.breadcrumbs').setup({})" \
     -c 'lua local o = _G.__nv_user_opts or {}; print("USER_NV", tostring(o.highlight), o.separator, o.depth_limit)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^USER_NV[[:space:]]+false[[:space:]]+>[[:space:]]+5$' <<<"$output"; then
+  if ! grep -Eq '^USER_NV[[:space:]]+false[[:space:]]+>[[:space:]]+5$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 breadcrumbs: user override of lvim.builtin.breadcrumbs.options did not flow through to nvim-navic.setup (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6633,7 +6722,7 @@ check_phase_6_breadcrumbs_on_attach_calls_navic_attach() {
     -c 'lua local h = require("lvim.lsp.handlers"); local on_attach = h.make_on_attach(); local fake_client = { name = "luals", server_capabilities = { documentSymbolProvider = true } }; on_attach(fake_client, 1)' \
     -c 'lua local a = _G.__nv_attached or {}; print("ATTACH_NV", #a, a[1] and a[1].name, a[1] and a[1].buf)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^ATTACH_NV[[:space:]]+1[[:space:]]+luals[[:space:]]+1$' <<<"$output"; then
+  if ! grep -Eq '^ATTACH_NV[[:space:]]+1[[:space:]]+luals[[:space:]]+1$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 breadcrumbs: on_attach did not call navic.attach for a documentSymbolProvider-capable client (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6653,7 +6742,7 @@ check_phase_6_breadcrumbs_on_attach_skips_without_capability() {
     -c 'lua local h = require("lvim.lsp.handlers"); local on_attach = h.make_on_attach(); local fake_client = { name = "tsserver", server_capabilities = { documentSymbolProvider = false } }; on_attach(fake_client, 1)' \
     -c 'lua print("NOCAP_NV", _G.__nv_attached)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^NOCAP_NV[[:space:]]+0$' <<<"$output"; then
+  if ! grep -Eq '^NOCAP_NV[[:space:]]+0$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 breadcrumbs: on_attach called navic.attach for a client without documentSymbolProvider (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6676,7 +6765,7 @@ check_phase_6_breadcrumbs_on_attach_skips_when_disabled() {
     -c 'lua local h = require("lvim.lsp.handlers"); local on_attach = h.make_on_attach(); local fake_client = { name = "luals", server_capabilities = { documentSymbolProvider = true } }; on_attach(fake_client, 1)' \
     -c 'lua print("DISABLED_NV", _G.__nv_attached)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^DISABLED_NV[[:space:]]+0$' <<<"$output"; then
+  if ! grep -Eq '^DISABLED_NV[[:space:]]+0$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 breadcrumbs: on_attach called navic.attach when lvim.builtin.breadcrumbs.active = false (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6705,7 +6794,7 @@ if has_entry and type(entry.enabled) == 'function' then \
 end; \
 print('GATE_NV', has_entry, on, off)" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^GATE_NV[[:space:]]+true[[:space:]]+true[[:space:]]+false$' <<<"$output"; then
+  if ! grep -Eq '^GATE_NV[[:space:]]+true[[:space:]]+true[[:space:]]+false$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 breadcrumbs: nvim-navic spec entry missing or not gated on lvim.builtin.breadcrumbs.active (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6729,7 +6818,7 @@ check_phase_6_breadcrumbs_literal_acceptance_require_returns_table() {
     -c 'lua package.loaded["nvim-navic"] = { setup = function(_) end, attach = function() end, get_location = function() return "" end }' \
     -c "lua print(type(require('nvim-navic')))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q 'table' <<<"$output"; then
+  if ! grep -q 'table' <<<"${output//$'\r'/}"; then
     printf 'phase 6 breadcrumbs: literal acceptance print(type(require("nvim-navic"))) did not emit "table" (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6756,7 +6845,7 @@ check_phase_6_breadcrumbs_toggle_drops_breadcrumbs_specifically() {
   baseline_out="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua local has = false; for _, p in pairs(require('lazy.core.config').plugins) do if (p[1] == 'SmiteshP/nvim-navic') or (p.url and p.url:match('SmiteshP/nvim%-navic')) then has = true; break end end; print('NV=' .. tostring(has))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^NV=true$' <<<"$baseline_out"; then
+  if ! grep -Eq '^NV=true$' <<<"${baseline_out//$'\r'/}"; then
     printf 'phase 6 breadcrumbs toggle: SmiteshP/nvim-navic not present in Config.plugins under baseline (output: %s)\n' "$baseline_out" >&2
     return 1
   fi
@@ -6766,7 +6855,7 @@ check_phase_6_breadcrumbs_toggle_drops_breadcrumbs_specifically() {
   toggled_out="$(LUNAVIM_CONFIG_DIR="$toggle_cfg" nvim --headless -u init.lua \
     -c "lua local has = false; for _, p in pairs(require('lazy.core.config').plugins) do if (p[1] == 'SmiteshP/nvim-navic') or (p.url and p.url:match('SmiteshP/nvim%-navic')) then has = true; break end end; print('NV=' .. tostring(has))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^NV=false$' <<<"$toggled_out"; then
+  if ! grep -Eq '^NV=false$' <<<"${toggled_out//$'\r'/}"; then
     printf 'phase 6 breadcrumbs toggle: SmiteshP/nvim-navic still present in Config.plugins with breadcrumbs.active=false (output: %s)\n' "$toggled_out" >&2
     return 1
   fi
@@ -6799,7 +6888,7 @@ local n = 0; for _ in pairs(i) do n = n + 1 end; \
 local missing = {}; for _, k in ipairs(expected) do local v = i[k]; if type(v) ~= 'string' or v == '' then table.insert(missing, k) end end; \
 print('ICONS_NV', n, #missing, table.concat(missing, ','))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^ICONS_NV[[:space:]]+26[[:space:]]+0[[:space:]]*$' <<<"$output"; then
+  if ! grep -Eq '^ICONS_NV[[:space:]]+26[[:space:]]+0[[:space:]]*$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 breadcrumbs: defaults.options.icons must be the prescribed 26-kind map with non-empty string glyphs (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6845,7 +6934,7 @@ check_phase_6_indentlines_defaults_shape() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua local t = lvim.builtin.indentlines; print(t.active, type(t.options), type(t.options.indent), t.options.indent.char, type(t.options.scope), t.options.scope.enabled)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^true[[:space:]]+table[[:space:]]+table[[:space:]]+│[[:space:]]+table[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^true[[:space:]]+table[[:space:]]+table[[:space:]]+│[[:space:]]+table[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 indentlines: lvim.builtin.indentlines defaults shape wrong (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6870,7 +6959,7 @@ check_phase_6_indentlines_setup_forwards_opts() {
     -c "lua require('lvim.plugins.modules.indentlines').setup({})" \
     -c 'lua local o = _G.__ibl_opts or {}; print("CAPTURED_IBL", type(o), o.indent and o.indent.char, o.scope and o.scope.enabled, o.active == nil)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^CAPTURED_IBL[[:space:]]+table[[:space:]]+│[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^CAPTURED_IBL[[:space:]]+table[[:space:]]+│[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 indentlines: module did not forward lvim.builtin.indentlines.options to ibl.setup (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6890,7 +6979,7 @@ check_phase_6_indentlines_setup_pcall_guards_missing() {
     -c 'lua package.loaded["ibl"] = nil; package.preload["ibl"] = nil' \
     -c "lua local ok, err = pcall(function() require('lvim.plugins.modules.indentlines').setup({}) end); print('PCALL_IBL', ok, err == nil)" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^PCALL_IBL[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^PCALL_IBL[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 indentlines: module setup raised when ibl was unavailable (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6915,7 +7004,7 @@ check_phase_6_indentlines_setup_does_not_mutate_builtin() {
     -c "lua require('lvim.plugins.modules.indentlines').setup({})" \
     -c 'lua local o = lvim.builtin.indentlines.options; print("LIVE_IBL", lvim.builtin.indentlines.active, o.indent.char, o.scope.enabled)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^LIVE_IBL[[:space:]]+true[[:space:]]+│[[:space:]]+true$' <<<"$output"; then
+  if ! grep -Eq '^LIVE_IBL[[:space:]]+true[[:space:]]+│[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 indentlines: ibl.setup observably mutated lvim.builtin.indentlines.options (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6944,7 +7033,7 @@ LUA
     -c "lua require('lvim.plugins.modules.indentlines').setup({})" \
     -c 'lua local o = _G.__ibl_user_opts or {}; print("USER_IBL", o.indent and o.indent.char, o.indent and o.indent.tab_char, o.exclude and o.exclude.filetypes and o.exclude.filetypes[1], o.exclude and o.exclude.filetypes and o.exclude.filetypes[2])' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^USER_IBL[[:space:]]+▏[[:space:]]+→[[:space:]]+alpha[[:space:]]+dashboard$' <<<"$output"; then
+  if ! grep -Eq '^USER_IBL[[:space:]]+▏[[:space:]]+→[[:space:]]+alpha[[:space:]]+dashboard$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 indentlines: user override of lvim.builtin.indentlines.options did not flow through to ibl.setup (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6974,7 +7063,7 @@ if has_entry and type(entry.enabled) == 'function' then \
 end; \
 print('GATE_IBL', has_entry, on, off)" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^GATE_IBL[[:space:]]+true[[:space:]]+true[[:space:]]+false$' <<<"$output"; then
+  if ! grep -Eq '^GATE_IBL[[:space:]]+true[[:space:]]+true[[:space:]]+false$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 indentlines: indent-blankline.nvim spec entry missing or not gated on lvim.builtin.indentlines.active (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -6998,7 +7087,7 @@ check_phase_6_indentlines_literal_acceptance_require_returns_table() {
     -c 'lua package.loaded["ibl"] = { setup = function(_) end }' \
     -c "lua print(type(require('ibl')))" \
     -c 'qall!' 2>&1)"
-  if ! grep -q 'table' <<<"$output"; then
+  if ! grep -q 'table' <<<"${output//$'\r'/}"; then
     printf 'phase 6 indentlines: literal acceptance print(type(require("ibl"))) did not emit "table" (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -7026,7 +7115,7 @@ check_phase_6_indentlines_toggle_drops_indentlines_specifically() {
   baseline_out="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "lua local has = false; for _, p in pairs(require('lazy.core.config').plugins) do if (p[1] == 'lukas-reineke/indent-blankline.nvim') or (p.url and p.url:match('lukas%-reineke/indent%-blankline%.nvim')) then has = true; break end end; print('IBL=' .. tostring(has))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^IBL=true$' <<<"$baseline_out"; then
+  if ! grep -Eq '^IBL=true$' <<<"${baseline_out//$'\r'/}"; then
     printf 'phase 6 indentlines toggle: lukas-reineke/indent-blankline.nvim not present in Config.plugins under baseline (output: %s)\n' "$baseline_out" >&2
     return 1
   fi
@@ -7036,7 +7125,7 @@ check_phase_6_indentlines_toggle_drops_indentlines_specifically() {
   toggled_out="$(LUNAVIM_CONFIG_DIR="$toggle_cfg" nvim --headless -u init.lua \
     -c "lua local has = false; for _, p in pairs(require('lazy.core.config').plugins) do if (p[1] == 'lukas-reineke/indent-blankline.nvim') or (p.url and p.url:match('lukas%-reineke/indent%-blankline%.nvim')) then has = true; break end end; print('IBL=' .. tostring(has))" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^IBL=false$' <<<"$toggled_out"; then
+  if ! grep -Eq '^IBL=false$' <<<"${toggled_out//$'\r'/}"; then
     printf 'phase 6 indentlines toggle: lukas-reineke/indent-blankline.nvim still present in Config.plugins with indentlines.active=false (output: %s)\n' "$toggled_out" >&2
     return 1
   fi
@@ -7067,7 +7156,7 @@ if has_entry and type(entry.enabled) == 'function' then \
 end; \
 print('GATE', has_entry, on, off)" \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^GATE[[:space:]]+true[[:space:]]+true[[:space:]]+false$' <<<"$output"; then
+  if ! grep -Eq '^GATE[[:space:]]+true[[:space:]]+true[[:space:]]+false$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 comment: mini.nvim spec entry missing or not gated on lvim.builtin.comment.active (output: %s)\n' "$output" >&2
     return 1
   fi

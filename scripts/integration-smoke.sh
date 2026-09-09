@@ -24,10 +24,36 @@ if ! command -v tree-sitter >/dev/null 2>&1; then
 fi
 
 TMP="$(mktemp -d -t lvim-integration-XXXXXX)"
+# Cleanup must never change the script's exit status.
+#
+# This run spawns real background processes -- mason installers, a language
+# server, treesitter parser builds -- and some can still be writing under $TMP
+# when the trap fires. `rm -rf` then fails with "Directory not empty", and
+# because the trap runs under `set -e` that turned a PASSING integration run
+# into a non-zero exit. It was timing-dependent: seen on Neovim 0.11, not 0.12,
+# with no behavioral difference between them.
+#
+# So: give stragglers a moment, retry a few times, and if the directory still
+# will not go, say so on stderr and leave it under /tmp rather than failing a
+# run that already reported OK.
 cleanup() {
+  local status=$?
+
   if [[ -n "${TMP:-}" && -d "$TMP" ]]; then
-    rm -rf "$TMP"
+    local _try
+    for _try in 1 2 3; do
+      if rm -rf "$TMP" 2>/dev/null; then
+        break
+      fi
+      sleep 1
+    done
+    if [[ -d "$TMP" ]]; then
+      printf '[integration-smoke] note: could not fully remove %s (a background process may still hold it)\n' \
+        "$TMP" >&2
+    fi
   fi
+
+  return "$status"
 }
 trap cleanup EXIT
 
