@@ -42,8 +42,41 @@ jobs:
       - name: Install ripgrep and fd
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ripgrep fd-find
+          # `apt-get update` refreshes EVERY configured repo, including the
+          # third-party ones preinstalled on the runner image (Google Chrome,
+          # Microsoft) that this workflow installs nothing from. One of them
+          # serving a bad index kills a job that has nothing to do with it:
+          # on 2026-09-09 dl.google.com served a Packages.gz whose hash did not
+          # match its index, and all three jobs failed here, twice in a row, on
+          # a green tree.
+          #
+          # So point apt at Ubuntu's archive ALONE for these two calls, by
+          # assembling a sources directory containing only Ubuntu's own file and
+          # overriding `Dir::Etc` for this invocation. Copying whatever file the
+          # image ships keeps this format-agnostic -- `ubuntu.sources` (deb822,
+          # what noble uses) and the legacy `sources.list` are both picked up by
+          # `sourceparts`, and a third-party repo added in EITHER format is
+          # excluded, which deleting `*.list` by extension would not manage.
+          # Nothing under /etc is modified.
+          #
+          # The check is a file test rather than `apt-cache policy`: policy
+          # reports a candidate from dpkg status even with no sources
+          # configured, so it cannot tell "archive present" from "archive gone".
+          ubuntu_only="$(mktemp -d)"
+          found_sources=0
+          for src in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
+            if [ -s "$src" ]; then
+              cp "$src" "$ubuntu_only/"
+              found_sources=1
+            fi
+          done
+          if [ "$found_sources" -ne 1 ]; then
+            echo "could not find Ubuntu's apt sources on this runner image" >&2
+            exit 1
+          fi
+          apt_only_ubuntu=(-o "Dir::Etc::sourcelist=/dev/null" -o "Dir::Etc::sourceparts=$ubuntu_only")
+          sudo apt-get "${apt_only_ubuntu[@]}" update
+          sudo apt-get "${apt_only_ubuntu[@]}" install -y --no-install-recommends ripgrep fd-find
           sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
 
       # The tree-sitter CLI is a hard requirement, not a nicety: README lists
@@ -96,8 +129,23 @@ jobs:
       - name: Install shellcheck
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends shellcheck
+          # Scope apt to Ubuntu's own archive; see the test job's "Install
+          # ripgrep and fd" step for why.
+          ubuntu_only="$(mktemp -d)"
+          found_sources=0
+          for src in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
+            if [ -s "$src" ]; then
+              cp "$src" "$ubuntu_only/"
+              found_sources=1
+            fi
+          done
+          if [ "$found_sources" -ne 1 ]; then
+            echo "could not find Ubuntu's apt sources on this runner image" >&2
+            exit 1
+          fi
+          apt_only_ubuntu=(-o "Dir::Etc::sourcelist=/dev/null" -o "Dir::Etc::sourceparts=$ubuntu_only")
+          sudo apt-get "${apt_only_ubuntu[@]}" update
+          sudo apt-get "${apt_only_ubuntu[@]}" install -y --no-install-recommends shellcheck
 
       - name: Cache stylua binary
         id: cache-stylua
