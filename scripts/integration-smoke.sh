@@ -120,6 +120,13 @@ printf '\n-- local change\n' >> "$WORK_DIR/sample.lua"
 cat > "$CONFIG_DIR/config.lua" <<'EOF'
 lvim.lsp.servers = { lua_ls = {} }
 lvim.lsp.ensure_installed = { "lua_ls" }
+
+-- Registering a linter here is load-bearing for step (g) below: config.lua runs
+-- BEFORE lazy.nvim is bootstrapped, so this call can only record the
+-- registration. Something after plugins.load() has to apply it.
+require("lvim.lsp.null-ls.linters").setup({
+  { name = "shellcheck", filetypes = { "sh" } },
+})
 EOF
 
 export LUNAVIM_RUNTIME_DIR="$RUNTIME_DIR"
@@ -452,6 +459,47 @@ fi
 # problem, and it avoids embedding a literal CR in a regex (which the `grep`
 # implementations in play do not agree on).
 log_normalized="$(tr -d '\r' < "$LOG")"
+# A second, cold startup against the now-populated runtime.
+#
+# This is the only place the startup ORDERING of the linter registration can be
+# observed. config.lua runs before lazy.nvim is bootstrapped, so the shim there
+# can only RECORD the registration; `lvim.start()` has to re-enter the backend
+# after `plugins.load()` for it to take effect. The driver above cannot test
+# this, because it installs the plugins mid-session -- at ITS startup nothing
+# was on disk yet. Only a fresh launch, with plugins already present, exercises
+# the real user's first-run-after-install path.
+#
+# `package.loaded["lint"]` is read WITHOUT requiring anything: a `require("lint")`
+# here would itself make lazy load nvim-lint and run its config callback, which
+# is the very thing under test -- a self-fulfilling assertion that passes with
+# the bug present. (Verified: it did.)
+echo "[integration-smoke] second startup: linter registration reaches nvim-lint"
+LINT_LOG="$TMP/lint-log"
+set +e
+nvim --headless \
+  --cmd "let g:lunavim_isolated_xdg = v:true" \
+  -u "$REPO_ROOT/init.lua" \
+  -c 'lua local l = package.loaded["lint"]; print("LINT_LOADED=" .. tostring(l ~= nil)); print("LINT_SH=" .. vim.inspect(l and l.linters_by_ft and l.linters_by_ft.sh or nil))' \
+  -c 'qall!' > "$LINT_LOG" 2>&1
+lint_rc=$?
+set -e
+lint_out="$(tr -d '\r' < "$LINT_LOG")"
+
+if (( lint_rc != 0 )); then
+  printf '[integration-smoke] second startup exited %d:\n%s\n' "$lint_rc" "$lint_out" >&2
+  exit 1
+fi
+if ! grep -q '^LINT_LOADED=true$' <<<"$lint_out"; then
+  printf '[integration-smoke] a linter registered in config.lua never reached nvim-lint.\n' >&2
+  printf 'config.lua runs before lazy.nvim exists, so lvim.start() must re-enter the\n' >&2
+  printf 'backend after plugins.load(). Output:\n%s\n' "$lint_out" >&2
+  exit 1
+fi
+if ! grep -q 'shellcheck' <<<"$lint_out"; then
+  printf '[integration-smoke] nvim-lint loaded but linters_by_ft.sh is wrong:\n%s\n' "$lint_out" >&2
+  exit 1
+fi
+
 if ! grep -q "^INTEGRATION_OK$" <<<"$log_normalized"; then
   echo "[integration-smoke] driver did not reach INTEGRATION_OK" >&2
   exit 1
