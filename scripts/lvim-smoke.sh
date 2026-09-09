@@ -5837,6 +5837,14 @@ check_phase_6_whichkey_defaults_mappings_full_list() {
   # duplicated LHS means one binding silently overwrites another, and a
   # by-LHS hash lookup (which `defaults_leader_groups` uses) cannot detect it.
   #
+  # Duplicates are keyed by (LHS, MODE), not by LHS alone. Keying on LHS alone
+  # flagged every visual-mode counterpart of a normal-mode binding -- a
+  # deliberate pattern here (the `mode = "x"` rows in `defaults.lua`) -- and
+  # failed CI on correct configuration.
+  #
+  # The mode handling lives in `tests/fixtures/whichkey-dupes.lua`; see that
+  # file for why a string mode splits per character and why `v`/`x` collide.
+  #
   # This check previously pinned the list to exactly six entries in a fixed
   # order — the early plan draft that seeded only group labels. The full
   # LunarVim mapping spec (~90 entries) was later ported in and the assertion
@@ -5847,7 +5855,7 @@ check_phase_6_whichkey_defaults_mappings_full_list() {
   cfg_dir="$(make_empty_config_dir)"
 
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
-    -c 'lua local m = lvim.builtin.whichkey.mappings; local seen, dupes, malformed = {}, {}, {}; for _, e in ipairs(m) do local lhs = type(e) == "table" and e[1] or nil; if type(lhs) ~= "string" then malformed[#malformed + 1] = tostring(lhs) elseif e.group == nil and e[2] == nil then malformed[#malformed + 1] = lhs elseif seen[lhs] then dupes[#dupes + 1] = lhs else seen[lhs] = true end end; print("WK_MAPS", #m >= 20, #dupes, #malformed, table.concat(dupes, ","), table.concat(malformed, ","))' \
+    -c 'luafile tests/fixtures/whichkey-dupes.lua' \
     -c 'qall!' 2>&1)"
   if ! grep -Eq '^WK_MAPS[[:space:]]+true[[:space:]]+0[[:space:]]+0[[:space:]]*$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 whichkey: mappings list has duplicate or malformed entries (output: %s)\n' "$output" >&2
