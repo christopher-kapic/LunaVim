@@ -785,4 +785,15 @@ return {
   lazy = {
     opts = {},
   },
+  -- File logging, consumed by `lvim/core/log.lua`. Writes to
+  -- `<cache>/lvim.log`.
+  --
+  -- `level` is the minimum severity recorded: trace|debug|info|warn|error|fatal.
+  -- `warn` by default so the file stays useful rather than noisy. Messages at
+  -- warn and above are also passed to `vim.notify`; set `notify = false` to
+  -- keep them in the file only.
+  log = {
+    level = "warn",
+    notify = true,
+  },
 }

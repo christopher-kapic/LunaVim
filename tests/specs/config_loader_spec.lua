@@ -102,7 +102,8 @@ describe("config_loader", function()
     -- `lvim.lang` stays absent: nothing read it, and per-language config
     -- already lives in `lvim.lsp.servers` and the conform registry.
     assert.is_nil(_G.lvim.lang)
-    assert.is_nil(_G.lvim.log)
+    -- `lvim.log` is back because `lvim/core/log.lua` now reads it.
+    assert.is_table(_G.lvim.log)
 
     -- Toggles are only legitimate alongside an implementation. `dap` is back
     -- because nvim-dap now ships with it; the rest stay absent until the same
