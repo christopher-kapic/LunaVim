@@ -443,6 +443,33 @@ return {
     -- by the module and is not exposed for user override here; Phase 6 may
     -- extend the surface if needed.
     comment = { active = true, options = {} },
+    -- Project-root detection, implemented natively in `lvim/core/project.lua`
+    -- rather than by a plugin -- see that file for why.
+    --
+    -- `patterns` are searched upward from the current file by `vim.fs.root`,
+    -- nearest match wins. `.git` is last so a monorepo package with its own
+    -- manifest is preferred over the enclosing repository.
+    --
+    -- `scope` selects which directory changes: "tab" (`:tcd`, the default --
+    -- each tab keeps its own project), "global" (`:cd`) or "window" (`:lcd`).
+    -- `manual_mode = true` disables the automatic change and leaves
+    -- `:LvimProjectRoot` as the on-demand escape hatch.
+    project = {
+      active = true,
+      manual_mode = false,
+      scope = "tab",
+      patterns = {
+        "package.json",
+        "pyproject.toml",
+        "Cargo.toml",
+        "go.mod",
+        "Makefile",
+        ".git",
+      },
+      -- Never treat these as a project root. `$HOME` containing a `.git` is a
+      -- common setup (dotfile repos) and cd-ing there is disorienting.
+      exclude_dirs = { "~" },
+    },
     -- Symbol-occurrence highlighting via RRethy/vim-illuminate. `options` is
     -- forwarded to `require("illuminate").configure(opts)` -- note `configure`,
     -- not `setup`.

@@ -98,6 +98,11 @@ function M.start()
   -- plugin) when nothing was registered.
   require("lvim.plugins.modules.lint").setup({})
 
+  -- Project-root detection. Registered after plugin load so its BufEnter
+  -- handler runs alongside the plugins that care about the working directory
+  -- (telescope, nvim-tree), and gated on `lvim.builtin.project.active`.
+  require("lvim.core.project").setup()
+
   -- Register :LvimInfo/:LvimUpdate/:LvimSyncCorePlugins/:LvimReload/
   -- :LvimCacheReset AFTER plugin load so :LvimInfo reads an accurate plugin
   -- count from `lazy.stats()` and :LvimSyncCorePlugins can resolve `lazy`

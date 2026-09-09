@@ -109,6 +109,7 @@ describe("config_loader", function()
     -- is true of them. `lir` is gone for good -- nvim-tree owns that role.
     assert.is_table(_G.lvim.builtin.dap)
     assert.is_table(_G.lvim.builtin.illuminate)
+    assert.is_table(_G.lvim.builtin.project)
     -- `lir` stays gone for good: nvim-tree already owns the explorer role, so
     -- a second one would be two things to configure for one job.
     assert.is_nil(_G.lvim.builtin.lir)

@@ -505,6 +505,9 @@ function M.setup()
   vim.api.nvim_create_user_command("LvimExplorer", lvim_explorer, { force = true })
   vim.api.nvim_create_user_command("BufferKill", buffer_kill, { force = true })
   vim.api.nvim_create_user_command("LvimTreesitterInfo", lvim_treesitter_info, { force = true })
+  vim.api.nvim_create_user_command("LvimProjectRoot", function()
+    require("lvim.core.project").change_to_root()
+  end, { force = true, desc = "Change directory to the current file's project root" })
 end
 
 return M
