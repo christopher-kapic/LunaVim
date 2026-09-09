@@ -128,6 +128,28 @@ local function mapping_enabled(entry)
   return true
 end
 
+-- The modes a which-key row applies to, as a list.
+--
+-- Mirrors which-key's own normalisation (`which-key/mappings.lua:277-278`):
+-- `mode` may be a list, or a STRING THAT IS SPLIT PER CHARACTER -- `"nx"` is
+-- two modes, not one -- and defaults to normal mode when absent. The filter
+-- has to agree with which-key on all three points, or it groups rows into
+-- modes which-key never used: a mode-less row attributed to no mode at all
+-- would make every group above it look childless, and a `mode = "nx"` child
+-- would fail to match its `mode = "n"` group.
+local function entry_modes(entry)
+  local mode = entry.mode
+  if type(mode) == "string" then
+    local split = vim.split(mode, "")
+    if #split > 0 then
+      return split
+    end
+  elseif type(mode) == "table" and #mode > 0 then
+    return mode
+  end
+  return { "n" }
+end
+
 -- Every prefix of `lhs` that could name a group, shortest first.
 --
 -- `<leader>xyz` belongs to both `<leader>xy` and `<leader>x`, so a filtered
@@ -162,33 +184,84 @@ end
 -- before binding anything under it, and an earlier version of this function
 -- discarded exactly that, silently losing user config. `had_children` is what
 -- separates "emptied by filtering" from "never had any".
+--
+-- Children are attributed PER MODE. which-key keeps one tree per mode, so a
+-- normal-mode `<leader>d` group and a visual-mode one are separate rows that
+-- empty independently: with nvim-dap absent, the normal-mode Debug group has
+-- to drop while a visual-mode `<leader>d` group holding unrelated bindings
+-- stays. Keying only on the lhs conflated the two, so one mode's surviving
+-- child kept the other mode's dead label alive.
+--
+-- A group row naming several modes is NARROWED, not kept or dropped whole.
+-- which-key registers such a row independently in each of its modes, so the
+-- modes decide separately: `{ "<leader>d", group = "Debug", mode = { "n", "x" } }`
+-- whose normal-mode children survive but whose visual-mode children were all
+-- filtered has to keep the label in normal mode and lose it in visual. Keeping
+-- the row whole leaves a visual row that opens onto nothing; dropping it whole
+-- loses a label that normal mode still earns. Rewriting `mode` to just the
+-- surviving modes is the only answer that is right in both.
+--
+-- A mode with no children AT ALL survives the narrowing, for the same reason a
+-- single-mode childless group is kept: it is a deliberate label a user
+-- declared before binding under it, not a group emptied by filtering.
+--
+-- The rewrite mutates the entry, which is safe because `M.setup` hands this
+-- function a `vim.deepcopy` of the user's table -- `lvim.builtin.whichkey.mappings`
+-- itself is never touched. An entry that loses no mode is left exactly as it
+-- was, so the common single-mode row is not rewritten into a list form the
+-- user did not write.
 local function filter_mappings(mappings)
   local kept = {}
   local had_children = {}
   local enabled_groups = {}
+
+  -- `\0` cannot appear in a mode name or an lhs, so it cannot be forged by a
+  -- key that merely contains the separator.
+  local function slot(mode, prefix)
+    return mode .. "\0" .. prefix
+  end
 
   for _, entry in ipairs(mappings) do
     if entry.group ~= nil then
       kept[#kept + 1] = entry
     else
       local prefixes = group_prefixes(entry[1])
-      for _, prefix in ipairs(prefixes) do
-        had_children[prefix] = true
-      end
-      if mapping_enabled(entry) then
-        kept[#kept + 1] = entry
+      local enabled = mapping_enabled(entry)
+      for _, mode in ipairs(entry_modes(entry)) do
         for _, prefix in ipairs(prefixes) do
-          enabled_groups[prefix] = true
+          had_children[slot(mode, prefix)] = true
+          if enabled then
+            enabled_groups[slot(mode, prefix)] = true
+          end
         end
+      end
+      if enabled then
+        kept[#kept + 1] = entry
       end
     end
   end
 
   local result = {}
   for _, entry in ipairs(kept) do
-    local emptied = entry.group ~= nil and had_children[entry[1]] and not enabled_groups[entry[1]]
-    if not emptied then
+    if entry.group == nil then
       result[#result + 1] = entry
+    else
+      local modes = entry_modes(entry)
+      local surviving = {}
+      for _, mode in ipairs(modes) do
+        local key = slot(mode, entry[1])
+        if enabled_groups[key] or not had_children[key] then
+          surviving[#surviving + 1] = mode
+        end
+      end
+
+      if #surviving == #modes then
+        result[#result + 1] = entry
+      elseif #surviving > 0 then
+        entry.mode = surviving
+        result[#result + 1] = entry
+      end
+      -- #surviving == 0: emptied in every mode it named, so the row goes.
     end
   end
 

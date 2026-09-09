@@ -221,7 +221,10 @@ return {
       -- Full mapping spec — ported from the upstream LunarVim reference's
       -- `lua/lvim/core/which-key.lua:86-203` (`references/CKLunarVim/...`).
       -- Each entry is a which-key v3 row: `{ "<lhs>", "<rhs>", desc = "..." }`
-      -- or `{ "<lhs>", group = "+label" }` for a group label. We materialise
+      -- or `{ "<lhs>", group = "+label" }` for a group label, optionally
+      -- carrying `mode = "x"` (default `"n"`) and `remap = true` for an rhs
+      -- that has to resolve through another mapping. The visual-mode rows
+      -- live in a block at the end of the list. We materialise
       -- the absolute `<leader>X` LHS form here (rather than CKLunarVim's
       -- bare-key form that's threaded through a `prepend_leader` helper at
       -- registration) so a user appending `lvim.builtin.whichkey.mappings`
@@ -254,11 +257,22 @@ return {
         { "<leader>;", "<cmd>Alpha<CR>", desc = "Dashboard" },
         { "<leader>w", "<cmd>w!<CR>", desc = "Save" },
         { "<leader>q", "<cmd>confirm q<CR>", desc = "Quit" },
-        {
-          "<leader>/",
-          "<cmd>lua require('mini.comment').toggle_lines(vim.api.nvim_win_get_cursor(0)[1], vim.api.nvim_win_get_cursor(0)[1])<CR>",
-          desc = "Comment toggle current line",
-        },
+        -- Delegates to mini.comment's own `gcc` rather than calling
+        -- `toggle_lines` directly, which is why `remap = true` is set (the
+        -- rhs has to resolve through another mapping). Delegation buys three
+        -- things the direct call cannot: a count (`3<leader>/`), dot-repeat,
+        -- and an accurate `ref_position` for the JSX/dotenv `hooks.pre` in
+        -- `lvim/plugins/modules/comment.lua` -- `toggle_lines` synthesises
+        -- `ref_position = { line_start, 1 }`, so the treesitter probe always
+        -- looked at column 1 instead of the cursor. The visual-mode twin
+        -- lives in the "Visual mode" block at the end of this list.
+        --
+        -- Safe when mini.comment is absent (`lvim.builtin.comment.active =
+        -- false`, or before its `BufReadPost` trigger fires): Neovim ships
+        -- built-in `gc`/`gcc` operators since 0.10, so the binding falls back
+        -- to a plain `commentstring` toggle instead of erroring the way the
+        -- old `require('mini.comment')` rhs did.
+        { "<leader>/", "gcc", desc = "Comment toggle current line", remap = true },
         { "<leader>c", "<cmd>BufferKill<CR>", desc = "Close Buffer" },
         { "<leader>f", "<cmd>Telescope find_files<CR>", desc = "Find File" },
         { "<leader>h", "<cmd>nohlsearch<CR>", desc = "No Highlight" },
@@ -372,6 +386,52 @@ return {
         -- Treesitter
         { "<leader>T", group = "Treesitter" },
         { "<leader>Ti", "<cmd>LvimTreesitterInfo<cr>", desc = "Info" },
+
+        -- Visual mode ------------------------------------------------------
+        --
+        -- Ported from the upstream reference's separate `vmappings` table
+        -- (`references/CKLunarVim/lua/lvim/core/which-key.lua:78-85`), which
+        -- was registered through `which_key.add(prepend_leader(vmappings,
+        -- "v"))`. LunaVim keeps ONE flat list and carries the mode on the row
+        -- instead, because which-key v3 treats `mode` as a first-class field
+        -- and a single list means a user appending their own binding does not
+        -- have to know which of two tables it belongs in.
+        --
+        -- `mode = "x"`, not `"v"`. `"v"` is visual + SELECT mode, and the
+        -- leader is a space: with a `"v"` mapping, pressing space to replace a
+        -- snippet placeholder in select mode would start a mapping wait
+        -- instead of typing. `"x"` covers charwise, linewise and blockwise
+        -- visual, which is all these bindings want.
+        --
+        -- Group rows are per-mode: which-key keeps one tree per mode, so the
+        -- normal-mode `{ "<leader>g", group = "Git" }` above does not label
+        -- the visual `<leader>g` prefix. The `mode = "x"` group rows below are
+        -- what put "Git" and "LSP" on the visual popup. `filter_mappings` in
+        -- `lvim/plugins/modules/whichkey.lua` pairs a group with its children
+        -- by mode too, so a group and its children must name the same mode.
+        { "<leader>/", "gc", desc = "Comment toggle linewise (visual)", mode = "x", remap = true },
+        { "<leader>l", group = "LSP", mode = "x" },
+        { "<leader>la", "<cmd>lua vim.lsp.buf.code_action()<cr>", desc = "Code Action", mode = "x" },
+        { "<leader>g", group = "Git", mode = "x" },
+        -- Gitsigns' `stage_hunk`/`reset_hunk` act on the cursor hunk when
+        -- called with no argument, so the selection has to be passed
+        -- explicitly. `line('v')` is the other end of the ACTIVE selection, so
+        -- this only works from a `<cmd>` mapping, which (unlike `:`) keeps
+        -- visual mode. The pair is unordered when the selection was made
+        -- upward; gitsigns sorts it (`gitsigns/cache.lua` `get_hunk` calls
+        -- `table.sort(range)`), and this is the form its own README documents.
+        {
+          "<leader>gr",
+          "<cmd>lua require 'gitsigns'.reset_hunk({ vim.fn.line('.'), vim.fn.line('v') })<cr>",
+          desc = "Reset Hunk",
+          mode = "x",
+        },
+        {
+          "<leader>gs",
+          "<cmd>lua require 'gitsigns'.stage_hunk({ vim.fn.line('.'), vim.fn.line('v') })<cr>",
+          desc = "Stage Hunk",
+          mode = "x",
+        },
       },
     },
     -- Floating/split terminal. The whole subtree (minus `active`) is forwarded
