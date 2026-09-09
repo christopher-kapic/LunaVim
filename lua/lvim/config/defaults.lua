@@ -443,6 +443,38 @@ return {
     -- by the module and is not exposed for user override here; Phase 6 may
     -- extend the surface if needed.
     comment = { active = true, options = {} },
+    -- Symbol-occurrence highlighting via RRethy/vim-illuminate. `options` is
+    -- forwarded to `require("illuminate").configure(opts)` -- note `configure`,
+    -- not `setup`.
+    --
+    -- `delay` is in milliseconds and deliberately larger than the 100ms
+    -- upstream default: illuminate re-resolves references on every cursor move,
+    -- and at 100ms that fires an LSP request while the user is still scrolling.
+    -- `large_file_cutoff` stops it running at all on files big enough that the
+    -- regex provider would be the slow path.
+    illuminate = {
+      active = true,
+      options = {
+        providers = { "lsp", "treesitter", "regex" },
+        delay = 200,
+        large_file_cutoff = 2000,
+        large_file_overrides = { providers = { "lsp" } },
+        filetypes_denylist = {
+          "NvimTree",
+          "TelescopePrompt",
+          "TelescopeResults",
+          "alpha",
+          "dapui_scopes",
+          "dapui_breakpoints",
+          "dapui_stacks",
+          "dapui_watches",
+          "help",
+          "lazy",
+          "mason",
+          "qf",
+        },
+      },
+    },
     -- Debugger (nvim-dap + nvim-dap-ui). Consumed by
     -- `lvim/plugins/modules/dap.lua`.
     --

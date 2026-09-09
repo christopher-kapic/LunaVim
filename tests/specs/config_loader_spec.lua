@@ -99,10 +99,8 @@ describe("config_loader", function()
     assert.is_table(_G.lvim.opt)
     assert.is_table(_G.lvim.lsp)
     assert.is_table(_G.lvim.lazy)
-    -- `lvim.lang` and `lvim.log` were removed: nothing in the runtime read
-    -- either one, so they were settings that silently did nothing. Assert they
-    -- stay absent, so a future change has to add a reader alongside the key
-    -- rather than reintroducing a dead surface.
+    -- `lvim.lang` stays absent: nothing read it, and per-language config
+    -- already lives in `lvim.lsp.servers` and the conform registry.
     assert.is_nil(_G.lvim.lang)
     assert.is_nil(_G.lvim.log)
 
@@ -110,9 +108,10 @@ describe("config_loader", function()
     -- because nvim-dap now ships with it; the rest stay absent until the same
     -- is true of them. `lir` is gone for good -- nvim-tree owns that role.
     assert.is_table(_G.lvim.builtin.dap)
-    for _, key in ipairs({ "illuminate", "lir", "project" }) do
-      assert.is_nil(_G.lvim.builtin[key], "lvim.builtin." .. key .. " should not exist without an implementation")
-    end
+    assert.is_table(_G.lvim.builtin.illuminate)
+    -- `lir` stays gone for good: nvim-tree already owns the explorer role, so
+    -- a second one would be two things to configure for one job.
+    assert.is_nil(_G.lvim.builtin.lir)
     assert.is_table(_G.lvim.keys)
     assert.is_table(_G.lvim.utils)
   end)

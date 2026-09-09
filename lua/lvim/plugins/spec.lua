@@ -491,6 +491,20 @@ return {
     config = setup("dap"),
   },
 
+  -- Highlight other references to the symbol under the cursor.
+  --
+  -- `event = { "BufReadPost", "BufNewFile" }` matches the sibling per-buffer
+  -- decorators (treesitter, mini.comment, indent-blankline): it arms as soon as
+  -- the user has a real buffer, which is the only time it can do anything.
+  {
+    "RRethy/vim-illuminate",
+    name = "illuminate",
+    enabled = gate("illuminate"),
+    event = { "BufReadPost", "BufNewFile" },
+    opts = {},
+    config = setup("illuminate"),
+  },
+
   -- Winbar breadcrumbs via SmiteshP/nvim-navic. Loaded lazily: the LSP
   -- on_attach callback in `lua/lvim/lsp/handlers.lua` calls
   -- `require('nvim-navic')` only after a server attaches AND

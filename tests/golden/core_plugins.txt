@@ -21,4 +21,5 @@ stevearc/conform.nvim
 saghen/blink.cmp
 mfussenegger/nvim-lint
 mfussenegger/nvim-dap
+RRethy/vim-illuminate
 SmiteshP/nvim-navic
