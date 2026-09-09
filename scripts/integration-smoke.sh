@@ -437,7 +437,22 @@ if (( rc != 0 )); then
   exit "$rc"
 fi
 
-if ! grep -q "^INTEGRATION_OK$" "$LOG"; then
+# The pattern tolerates a trailing CR: Neovim 0.11 terminates headless
+# `print()` lines with CRLF (0.12 uses LF), so the driver's success token
+# arrives as `INTEGRATION_OK\r` and a plain anchored match silently fails on the
+# minimum supported version -- reporting "driver did not reach INTEGRATION_OK"
+# for a run that had in fact completed every step.
+#
+# The CR is stripped into a variable first, rather than streamed as
+# `tr -d '\r' | grep -q`. This script runs under `set -o pipefail`, and
+# `grep -q` exits as soon as it matches; `tr` is then killed by SIGPIPE while
+# still writing, and pipefail turns that into a failed condition -- so the
+# streaming form would report failure precisely when the token WAS found early
+# in a large log. A command substitution is not a pipeline, so it has neither
+# problem, and it avoids embedding a literal CR in a regex (which the `grep`
+# implementations in play do not agree on).
+log_normalized="$(tr -d '\r' < "$LOG")"
+if ! grep -q "^INTEGRATION_OK$" <<<"$log_normalized"; then
   echo "[integration-smoke] driver did not reach INTEGRATION_OK" >&2
   exit 1
 fi
