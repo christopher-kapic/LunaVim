@@ -95,6 +95,10 @@ parse_args() {
   done
 }
 
+# shellcheck disable=SC2016
+# The `grep -Fq '...$LVIM_...'` calls below match LITERAL text in the
+# launcher file, to confirm it is ours before removing it; the `$` must not
+# expand. A directive cannot sit mid-`&&` chain, so it is scoped to the function.
 launcher_is_lunavim() {
   local target="$1"
 

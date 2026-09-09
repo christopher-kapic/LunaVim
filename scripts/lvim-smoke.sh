@@ -5,9 +5,15 @@ check_nvim_init() {
   local init_file="$1"
   local output
   local rc
+  local cfg_dir
+  # Own empty config dir. Without it this check -- the very first one to run --
+  # loads the developer's real `~/.config/lvim/config.lua`, so its result
+  # depends on whatever that user happens to have configured, and differs again
+  # on a clean runner that has no config at all.
+  cfg_dir="$(make_empty_config_dir)"
 
   set +e
-  output="$(nvim --headless -u "$init_file" -c 'qall!' 2>&1)"
+  output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u "$init_file" -c 'qall!' 2>&1)"
   rc=$?
   set -e
 
@@ -48,6 +54,15 @@ trap cleanup_smoke_tmp EXIT
 # polluted by sibling tests warming the shared dir.
 export LUNAVIM_RUNTIME_DIR="$SMOKE_TMP_BASE/runtime"
 mkdir -p "$LUNAVIM_RUNTIME_DIR"
+
+# Isolate the cache dir too. `lvim.core.options.setup()` creates and writes
+# `<cache>/undo` on every normal boot, so without this the ~265 Neovim launches
+# in this script all read and write the developer's real `~/.cache/lvim` --
+# both local-state pollution and another way the suite behaves differently on a
+# clean runner than on a machine that has been used. The cache-reset check
+# overrides this with its own dir, which is still correct.
+export LUNAVIM_CACHE_DIR="$SMOKE_TMP_BASE/cache"
+mkdir -p "$LUNAVIM_CACHE_DIR"
 
 # A config dir containing an empty config.lua so the loader does not emit the
 # "No user config at ..." hint, but the dir is otherwise inert (no fixture
@@ -142,6 +157,9 @@ check_user_config_applied() {
 
   output_leader="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua print(lvim.leader)' -c 'qall!' 2>&1)"
+  # shellcheck disable=SC1003  # literal backslashes are exactly what we grep
+  # for -- the fixture sets a backslash leader, which reaches this comparison
+  # as two literal backslash characters.
   if ! grep -F '\\' <<<"$output_leader" >/dev/null; then
     printf 'user config did not set lvim.leader (output: %s)\n' "$output_leader" >&2
     return 1
@@ -165,6 +183,9 @@ check_user_config_literal_acceptance() {
 
   output_leader="$(LUNAVIM_CONFIG_DIR="$repo_dir/tests/fixtures" nvim --headless -u init.lua \
     -c 'lua print(lvim.leader)' -c 'qall!' 2>&1)"
+  # shellcheck disable=SC1003  # literal backslashes are exactly what we grep
+  # for -- the fixture sets a backslash leader, which reaches this comparison
+  # as two literal backslash characters.
   if ! grep -F '\\' <<<"$output_leader" >/dev/null; then
     printf 'literal acceptance: lvim.leader not set via tests/fixtures (output: %s)\n' \
       "$output_leader" >&2
@@ -522,6 +543,14 @@ check_globals_present() {
   local output
   local rc
   local lua_check
+  local cfg_dir
+  # Point at an empty config dir, as the sibling checks do. Without it this
+  # check inherits the developer's real ~/.config/lvim: when that file is
+  # absent -- every clean CI runner -- the loader emits a "No user config at
+  # ..." notice that lands on the same line as GLOBALS_OK, and the anchored
+  # grep below stops matching. The check then passed for anyone who happened to
+  # have a config and failed for everyone who did not.
+  cfg_dir="$(make_empty_config_dir)"
   read -r -d '' lua_check <<'LUA' || true
 local names = {'get_runtime_dir','get_config_dir','get_cache_dir','get_lvim_base_dir'}
 local ok = true
@@ -542,7 +571,7 @@ print(ok and 'GLOBALS_OK' or 'GLOBALS_BAD')
 LUA
 
   set +e
-  output="$(nvim --headless -u init.lua -c "lua $lua_check" -c 'qall!' 2>&1)"
+  output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua -c "lua $lua_check" -c 'qall!' 2>&1)"
   rc=$?
   set -e
 
@@ -4512,6 +4541,8 @@ check_phase_6_nvimtree_on_attach_cr_passes_node() {
     -c 'lua local captured, got; local node = { name = "sentinel" }; package.loaded["nvim-tree"] = { setup = function(o) captured = o end }; package.loaded["nvim-tree.api"] = { tree = { get_node_under_cursor = function() return node end, change_root_to_node = function(n) got = n end }, node = { open = { edit = function(n) got = n end, vertical = function(n) got = n end }, navigate = { parent_close = function(n) got = n end } }, config = { mappings = { default_on_attach = function(_) end } } }; require("lvim.plugins.modules.nvimtree").setup({}); local bufnr = vim.api.nvim_create_buf(false, true); captured.on_attach(bufnr); vim.api.nvim_set_current_buf(bufnr); local m = vim.fn.maparg("<CR>", "n", false, true); if type(m) == "table" and type(m.callback) == "function" then m.callback() end; print("NODEMAP", got == node)' \
     -c 'qall!' 2>&1)"
   if ! grep -Eq '^NODEMAP[[:space:]]+true$' <<<"$output"; then
+    # shellcheck disable=SC2016  # the backticks are prose, not a command
+    # substitution, and there is nothing to expand in this format string.
     printf 'phase 6 nvimtree: on_attach `<CR>` mapping did not pass the current node into api.node.open.edit (output: %s)\n' "$output" >&2
     return 1
   fi

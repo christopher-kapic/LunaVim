@@ -253,6 +253,10 @@ install_launcher() {
   esac
 }
 
+# shellcheck disable=SC2016
+# The two `grep -Fq '...$LVIM_...'` calls below match LITERAL text in the
+# launcher file, so the `$` must not expand. A directive cannot sit mid-`&&`
+# chain, so it is scoped to the whole function.
 launcher_matches_install_dir() {
   local target="$1"
   local quoted_install_dir
