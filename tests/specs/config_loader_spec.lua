@@ -99,8 +99,20 @@ describe("config_loader", function()
     assert.is_table(_G.lvim.opt)
     assert.is_table(_G.lvim.lsp)
     assert.is_table(_G.lvim.lazy)
-    assert.is_table(_G.lvim.lang)
-    assert.is_table(_G.lvim.log)
+    -- `lvim.lang` and `lvim.log` were removed: nothing in the runtime read
+    -- either one, so they were settings that silently did nothing. Assert they
+    -- stay absent, so a future change has to add a reader alongside the key
+    -- rather than reintroducing a dead surface.
+    assert.is_nil(_G.lvim.lang)
+    assert.is_nil(_G.lvim.log)
+
+    -- Same for the four builtin toggles that promised features nothing
+    -- implemented. `lvim.builtin.dap.active = true` claimed a debugger that was
+    -- never installed; the toggle is re-added by the commit that adds the
+    -- plugin behind it.
+    for _, key in ipairs({ "dap", "illuminate", "lir", "project" }) do
+      assert.is_nil(_G.lvim.builtin[key], "lvim.builtin." .. key .. " should not exist without an implementation")
+    end
     assert.is_table(_G.lvim.keys)
     assert.is_table(_G.lvim.utils)
   end)
@@ -165,10 +177,7 @@ describe("config_loader", function()
 
   it("load_user_config() accepts LUNARVIM_CONFIG_DIR as an alias for LUNAVIM_CONFIG_DIR", function()
     local config_dir = make_tempdir()
-    write_file(
-      config_dir .. "/config.lua",
-      'lvim.leader = "Y"\n'
-    )
+    write_file(config_dir .. "/config.lua", 'lvim.leader = "Y"\n')
     setenv("LUNARVIM_CONFIG_DIR", config_dir)
 
     local config = require("lvim.config")

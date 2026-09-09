@@ -275,24 +275,6 @@ return {
         { "<leader>bl", "<cmd>BufferLineCloseRight<cr>", desc = "Close all to the right" },
         { "<leader>bD", "<cmd>BufferLineSortByDirectory<cr>", desc = "Sort by directory" },
         { "<leader>bL", "<cmd>BufferLineSortByExtension<cr>", desc = "Sort by language" },
-        -- Debug (nvim-dap; commands resolve lazily at press time so an
-        -- uninstalled dap surfaces as a missing-module error rather than
-        -- the whichkey popup hiding the binding entirely).
-        { "<leader>d", group = "Debug" },
-        { "<leader>dt", "<cmd>lua require'dap'.toggle_breakpoint()<cr>", desc = "Toggle Breakpoint" },
-        { "<leader>db", "<cmd>lua require'dap'.step_back()<cr>", desc = "Step Back" },
-        { "<leader>dc", "<cmd>lua require'dap'.continue()<cr>", desc = "Continue" },
-        { "<leader>dC", "<cmd>lua require'dap'.run_to_cursor()<cr>", desc = "Run To Cursor" },
-        { "<leader>dd", "<cmd>lua require'dap'.disconnect()<cr>", desc = "Disconnect" },
-        { "<leader>dg", "<cmd>lua require'dap'.session()<cr>", desc = "Get Session" },
-        { "<leader>di", "<cmd>lua require'dap'.step_into()<cr>", desc = "Step Into" },
-        { "<leader>do", "<cmd>lua require'dap'.step_over()<cr>", desc = "Step Over" },
-        { "<leader>du", "<cmd>lua require'dap'.step_out()<cr>", desc = "Step Out" },
-        { "<leader>dp", "<cmd>lua require'dap'.pause()<cr>", desc = "Pause" },
-        { "<leader>dr", "<cmd>lua require'dap'.repl.toggle()<cr>", desc = "Toggle Repl" },
-        { "<leader>ds", "<cmd>lua require'dap'.continue()<cr>", desc = "Start" },
-        { "<leader>dq", "<cmd>lua require'dap'.close()<cr>", desc = "Quit" },
-        { "<leader>dU", "<cmd>lua require'dapui'.toggle({reset = true})<cr>", desc = "Toggle UI" },
         -- Plugins (lazy.nvim subcommands)
         { "<leader>p", group = "Plugins" },
         { "<leader>pi", "<cmd>Lazy install<cr>", desc = "Install" },
@@ -469,7 +451,6 @@ return {
       },
       signature = { enabled = true },
     },
-    dap = { active = true },
     -- Dashboard. The whole subtree (minus `active`) is consumed by
     -- `lvim/plugins/modules/alpha.lua`. `mode` selects an `alpha.themes.*`
     -- preset; only "dashboard" is wired by Phase 6 (the upstream theme module
@@ -574,7 +555,6 @@ return {
         highlight = true,
       },
     },
-    illuminate = { active = true },
     -- Indent guides via lukas-reineke/indent-blankline.nvim. v3 of the plugin
     -- renamed the Lua module from `indent_blankline` to `ibl` and replaced
     -- v2's flat options/global vars with a deeply nested config table. The
@@ -591,8 +571,6 @@ return {
         scope = { enabled = true },
       },
     },
-    lir = { active = true },
-    project = { active = true },
     -- mason.nvim. The whole subtree (minus `active`) is forwarded to
     -- `require('mason').setup(opts)` by `lvim/lsp/init.lua`. Scaffolding
     -- `ui.{border,icons}` here means a user writing
@@ -696,9 +674,5 @@ return {
   },
   lazy = {
     opts = {},
-  },
-  lang = {},
-  log = {
-    level = "warn",
   },
 }

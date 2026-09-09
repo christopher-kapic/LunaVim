@@ -5766,9 +5766,9 @@ check_phase_6_whichkey_setup_forwards_opts() {
   # `<leader>f`, from when the defaults seeded only group labels; the full
   # LunarVim mapping spec was later ported in (~80 entries, led by
   # `<leader>;`) and this check was never updated. An exact count is also the
-  # wrong shape here because the module filters entries at runtime: the dap
-  # bindings drop out when nvim-dap is not installed, so the length legitimately
-  # differs between machines.
+  # wrong shape here because the module filters entries at runtime: the lazygit
+  # binding drops out when the `lazygit` executable is absent, so the length
+  # legitimately differs between machines.
   if ! grep -Eq '^CAPTURED_WK[[:space:]]+table[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"$output"; then
     printf 'phase 6 whichkey: module did not forward lvim.builtin.whichkey.setup/mappings to which-key.setup/add (output: %s)\n' "$output" >&2
     return 1
@@ -5815,9 +5815,9 @@ LUA
     -c 'qall!' 2>&1)"
   # The count is a floor, not an exact value: the defaults now seed the full
   # ported LunarVim mapping spec rather than the six group labels this check
-  # was written against, and the module filters entries at runtime (the dap
-  # bindings drop out when nvim-dap is absent), so the exact length varies by
-  # machine. The user's appended `<leader>x` group is the assertion that
+  # was written against, and the module filters entries at runtime (the lazygit
+  # binding drops out when the `lazygit` executable is absent), so the exact
+  # length varies by machine. The user's appended `<leader>x` group is the assertion that
   # actually matters — it also pins that a group with no child bindings
   # survives filtering, which is user config the filter used to discard.
   if ! grep -Eq '^USER_WK[[:space:]]+modern[[:space:]]+true[[:space:]]+\+extra$' <<<"$output"; then

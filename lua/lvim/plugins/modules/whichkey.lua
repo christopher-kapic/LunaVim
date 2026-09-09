@@ -19,69 +19,42 @@
 -- guard is used by every other module under `lvim/plugins/modules/`.
 local M = {}
 
-local function has_module(name)
-  local ok = pcall(require, name)
-  return ok
-end
-
+-- Generic "hide a binding whose backing tool is not available" gate.
+--
+-- Keyed on what the binding DOES, not on the key it happens to sit at. The
+-- lazygit check used to require the lhs to be exactly `<leader>gg`, so a user
+-- who moved lazygit to another key lost the gate and got a popup row that
+-- errors on press. Matching the rhs fixes that, and makes the group-emptying
+-- logic in `filter_mappings` testable at any nesting depth.
+--
+-- The nvim-dap detection that used to live here went out alongside the
+-- `<leader>d` group, in the commit that removed the dead `lvim.builtin.dap`
+-- toggle. It returns with the real dap integration.
 local function mapping_enabled(entry)
-  local lhs = entry[1]
   local rhs = entry[2]
-
-  if lhs == "<leader>gg" and rhs == "<cmd>lua require('lvim.plugins.modules.terminal').toggle_lazygit()<cr>" then
-    return vim.fn.executable("lazygit") == 1
-  end
 
   if type(rhs) ~= "string" then
     return true
   end
 
-  -- Match the spellings Lua accepts for requiring a module, since these rhs
-  -- strings are user-editable: require'dap', require "dap", require('dap'),
-  -- require([[dap]]), require([=[dap]=]).
-  --
-  -- `%f[%w_]` is Lua's frontier pattern, matching the transition into a word
-  -- character. It is what stops `myrequire('dap')` from counting as a require
-  -- of dap. The closing quote/bracket right after the name is what stops
-  -- `dapui` from matching a search for `dap`.
-  --
-  -- This is a heuristic over strings, not a parser: a binding that merely
-  -- prints the text `require('dap')` would also be treated as needing dap.
-  -- That trade is deliberate -- the cost is one hidden mapping in an
-  -- unrealistic case, versus a popup row that errors on press in a realistic
-  -- one.
-  local function requires_module(name)
-    local patterns = {
-      "%f[%w_]require%s*%(%s*['\"]" .. name .. "['\"]",
-      "%f[%w_]require%s*['\"]" .. name .. "['\"]",
-      "%f[%w_]require%s*%(?%s*%[=*%[" .. name .. "%]=*%]",
-    }
-    for _, pattern in ipairs(patterns) do
-      if rhs:find(pattern) then
-        return true
-      end
-    end
-    return false
-  end
-
-  if requires_module("dapui") then
-    return has_module("dapui")
-  end
-
-  if requires_module("dap") then
-    return has_module("dap")
+  -- Match LunaVim's OWN lazygit call, by module path and function together.
+  -- A bare `toggle_lazygit` substring would also hide a user's unrelated
+  -- `require('my.plugin').toggle_lazygit()` binding, or any mapping that merely
+  -- contains that text as data.
+  if rhs:find("lvim.plugins.modules.terminal", 1, true) and rhs:find("toggle_lazygit", 1, true) then
+    return vim.fn.executable("lazygit") == 1
   end
 
   return true
 end
 
--- Every prefix of `lhs` that could name a group, longest first.
+-- Every prefix of `lhs` that could name a group, shortest first.
 --
--- `<leader>dar` belongs to both `<leader>da` and `<leader>d`, so a filtered
+-- `<leader>xyz` belongs to both `<leader>xy` and `<leader>x`, so a filtered
 -- child has to mark BOTH as having had children. Matching only the single
--- character after `<leader>` attributed `<leader>dar` to `<leader>d` alone,
--- which left a nested `<leader>da` group standing after every one of its
--- bindings was filtered away — a which-key row that opens onto nothing.
+-- character after `<leader>` attributed it to `<leader>x` alone, which left a
+-- nested `<leader>xy` group standing after every one of its bindings had been
+-- filtered away -- a which-key row that opens onto nothing.
 local function group_prefixes(lhs)
   local body = lhs:match("^<leader>(.+)$")
   if not body then
@@ -98,10 +71,10 @@ end
 -- Drop bindings whose backing plugin is absent, and drop a group label only
 -- when every binding that lived under it was dropped.
 --
--- The case this exists for: the `<leader>d` Debug group's entries all call
--- `require('dap')`. With nvim-dap not installed they are filtered out, and
--- leaving the group label behind would put a Debug row in the which-key popup
--- that opens onto nothing.
+-- The case this exists for: a group whose every binding is gated on a tool that
+-- is not installed. Leaving the label behind would put a row in the which-key
+-- popup that opens onto nothing. The lazygit binding is the live gate today;
+-- the debug group will use the same path when nvim-dap returns.
 --
 -- A group with NO child bindings at all is kept. It is not an emptied group,
 -- it is a user's deliberate label -- `table.insert(lvim.builtin.whichkey.mappings,
