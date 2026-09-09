@@ -3562,6 +3562,99 @@ check_phase_43_resetup_drains_augroup_when_disabled() {
   fi
 }
 
+check_lsp_automatic_autocmd_wired() {
+  # The ordering trap this repo has now hit three times: anything that reaches
+  # for a plugin module has to run AFTER `plugins.load()`, and `config.lua` is
+  # loaded well before it. `lvim.lsp.automatic.setup()` is called from step (d)
+  # of the LSP orchestrator for exactly that reason.
+  #
+  # A regression that moved the call into `config.lua`, or dropped it, leaves
+  # the FileType autocmd unregistered -- and every plenary spec still passes,
+  # because those call `setup()` directly. Only a real `lvim.start()` shows it.
+  local cfg_dir output n
+  cfg_dir="$(make_empty_config_dir)"
+
+  output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
+    -c "lua print('AUTO=' .. #vim.api.nvim_get_autocmds({ group = 'lvim_lsp_automatic', event = 'FileType' }))" \
+    -c 'qall!' 2>&1)"
+  n="$(grep -Eo 'AUTO=[0-9]+' <<<"${output//$'\r'/}" | head -1 | cut -d= -f2)"
+  if [[ -z "$n" ]] || (( n < 1 )); then
+    printf 'lsp automatic: lvim.start() left the lvim_lsp_automatic FileType autocmd unregistered (output: %s)\n' "$output" >&2
+    return 1
+  fi
+}
+
+check_lsp_automatic_silent_headless() {
+  # Opening a file headless must never prompt, never install, and never record a
+  # decision. This suite boots Neovim a few hundred times and opens real files;
+  # `vim.ui.select` with no UI would either block or fire a callback nobody
+  # answered.
+  #
+  # mason, lspconfig AND `vim.lsp.config` ARE STUBBED ON PURPOSE. The smoke harness runs with
+  # `install.missing = false`, so neither plugin is on disk, and
+  # `automatic.plan()` correctly offers nothing when either is missing -- which
+  # means without stubs this check passes no matter what the headless guard
+  # does. That is not hypothetical: it went vacuous twice while this feature was
+  # being written -- when `plan()` learned to require a loadable mason, then
+  # lspconfig, then a resolvable blueprint for each candidate. The third time,
+  # the precondition below is what caught it.
+  #
+  # So the check now VERIFIES ITS OWN PRECONDITION first: with the stubs in
+  # place, `plan()` must actually have something to offer. If a future gate
+  # empties it again, this fails loudly instead of silently proving nothing.
+  #
+  # Then three independent observations, because "no picker" alone is not the
+  # contract -- a regression that skipped the picker and installed directly, or
+  # persisted an answer nobody gave, would pass a picker-only assertion:
+  #   SELECTED  - a stubbed `vim.ui.select` records being reached at all.
+  #   REGISTRY  - a stubbed `mason-registry` records `get_package` being
+  #               reached, which only the install path does. Probing
+  #               `package.loaded` instead would prove nothing here: the real
+  #               plugin is not on disk, so a regression that tried to require
+  #               it would fail and leave the entry nil.
+  #   STATE     - the decision store must not exist; nothing was answered.
+  local cfg_dir output
+  cfg_dir="$(make_empty_config_dir)"
+
+  output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
+    -c 'lua package.loaded["lspconfig"] = {}' \
+    -c 'lua vim.lsp.config = setmetatable({}, { __index = function(_, name) return name == "vtsls" and { cmd = { "sh" }, filetypes = { "typescriptreact" } } or nil end })' \
+    -c 'lua package.loaded["mason-lspconfig"] = { get_available_servers = function() return { "vtsls" } end, get_installed_servers = function() return {} end, get_mappings = function() return { lspconfig_to_package = { vtsls = "vtsls" } } end }' \
+    -c 'lua _G.__REGISTRY_USED = false; package.loaded["mason-registry"] = { get_package = function() _G.__REGISTRY_USED = true; return { is_installing = function() return false end, install = function() end } end }' \
+    -c 'lua _G.__SELECT_CALLED = false; vim.ui.select = function() _G.__SELECT_CALLED = true end' \
+    -c 'lua print("OFFERABLE=" .. tostring(#require("lvim.lsp.automatic").plan("typescriptreact") > 0))' \
+    -c 'edit tests/fixtures/sample.tsx' \
+    -c 'lua vim.wait(300, function() return _G.__SELECT_CALLED end)' \
+    -c 'lua print("SELECTED=" .. tostring(_G.__SELECT_CALLED) .. " REGISTRY=" .. tostring(_G.__REGISTRY_USED) .. " STATE=" .. tostring(vim.fn.isdirectory(require("lvim.lsp.automatic").state_dir()) == 1))' \
+    -c 'qall!' 2>&1)"
+  local clean="${output//$'\r'/}"
+  if ! grep -Eq '^OFFERABLE=true$' <<<"$clean"; then
+    printf 'lsp automatic: this check is vacuous -- with mason and lspconfig stubbed, plan() still offers nothing, so it cannot observe the headless guard (output: %s)\n' "$output" >&2
+    return 1
+  fi
+  if ! grep -Eq '^SELECTED=false REGISTRY=false STATE=false$' <<<"$clean"; then
+    printf 'lsp automatic: a headless file open prompted, installed, or recorded a decision (output: %s)\n' "$output" >&2
+    return 1
+  fi
+}
+
+check_lsp_automatic_forget_command() {
+  # `:LvimLspForget` is how a user undoes a "never ask again". Registered by
+  # `lvim.core.commands.setup()`, which is a different call site from the
+  # module itself -- so a module that exists but was never wired to a command
+  # would pass every spec and still leave the decision unreachable.
+  local cfg_dir output
+  cfg_dir="$(make_empty_config_dir)"
+
+  output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
+    -c "lua print('FORGET=' .. tostring(vim.fn.exists(':LvimLspForget') == 2))" \
+    -c 'qall!' 2>&1)"
+  if ! grep -Eq '^FORGET=true$' <<<"${output//$'\r'/}"; then
+    printf 'lsp automatic: :LvimLspForget is not registered (output: %s)\n' "$output" >&2
+    return 1
+  fi
+}
+
 check_phase_51_treesitter_module_present() {
   # Phase 5.1 lives in lua/lvim/plugins/modules/treesitter.lua. Pin the file's
   # presence so a regression that moves/renames it (so the spec's
@@ -7234,6 +7327,9 @@ run_check check_phase_45_signs_numhl_render_with_prescribed_highlight
 run_check check_phase_45_signs_numhl_user_override_renders
 run_check check_phase_45_signs_text_deep_merges_per_severity
 run_check check_phase_45_user_overrides_merged
+run_check check_lsp_automatic_autocmd_wired
+run_check check_lsp_automatic_silent_headless
+run_check check_lsp_automatic_forget_command
 run_check check_phase_51_treesitter_module_present
 run_check check_phase_51_treesitter_defaults_shape
 run_check check_phase_51_treesitter_setup_forwards_opts

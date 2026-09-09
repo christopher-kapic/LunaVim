@@ -344,6 +344,14 @@ local function lvim_reload()
     require("lvim.plugins.modules.dap").setup({})
   end
 
+  -- Re-arm the automatic language-server offer against the fresh config, for
+  -- the same reason as format above: `load_defaults()` replaces `_G.lvim`, so
+  -- flipping `lvim.lsp.automatic.enabled` (or the mason toggle) and reloading
+  -- has to be able to remove the autocmd, not just add it. `setup()` recreates
+  -- the group with `clear = true` and returns early when disabled, so this
+  -- replaces rather than stacks.
+  require("lvim.lsp.automatic").setup()
+
   vim.notify("LvimReload OK", vim.log.levels.INFO)
 end
 
@@ -508,6 +516,26 @@ function M.setup()
   vim.api.nvim_create_user_command("LvimProjectRoot", function()
     require("lvim.core.project").change_to_root()
   end, { force = true, desc = "Change directory to the current file's project root" })
+
+  -- Clear remembered answers to the "install a language server?" prompt.
+  -- With no argument it forgets every filetype; with one it forgets that
+  -- filetype, which is how a user undoes a "never ask again" they regret.
+  vim.api.nvim_create_user_command("LvimLspForget", function(cmd_opts)
+    local ft = cmd_opts.args ~= "" and cmd_opts.args or nil
+    local cleared = require("lvim.lsp.automatic").forget(ft)
+    local what = ft and ("the decision for " .. ft) or "all decisions"
+    if cleared then
+      vim.notify("LvimLspForget: cleared " .. what, vim.log.levels.INFO)
+    else
+      -- An unwritable cache dir is the usual cause. Saying "cleared" when the
+      -- refusal is still on disk sends the user looking in the wrong place.
+      vim.notify("LvimLspForget: could not clear " .. what, vim.log.levels.ERROR)
+    end
+  end, {
+    force = true,
+    nargs = "?",
+    desc = "Forget remembered language-server install decisions",
+  })
 end
 
 return M

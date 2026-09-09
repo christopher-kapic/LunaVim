@@ -132,6 +132,11 @@ function M.setup()
       end
     end
   end
+
+  -- (d) automatic per-filetype activation. Registers a FileType autocmd; the
+  -- mason lookups it performs happen at fire time, not here, so this stays
+  -- cheap on a boot where no file is opened.
+  require("lvim.lsp.automatic").setup()
 end
 
 return M

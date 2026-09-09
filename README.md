@@ -129,11 +129,43 @@ lvim.plugins = {
 -- LSP servers managed via mason
 lvim.lsp.ensure_installed = { "lua_ls", "pyright" }
 
+-- Pick a different server for one filetype; the other defaults are untouched
+lvim.lsp.automatic.preferred.python = { "pyright" }
+lvim.lsp.automatic.preferred.go = { "gopls" }
+
 -- A custom keymap
 lvim.keys.normal_mode["<leader>w"] = "<cmd>w<cr>"
 ```
 
 After editing, run `:LvimReload` (or restart `lvim`) to apply changes.
+
+### Language servers
+
+Open a file and LunaVim offers to install a language server for it, once per
+filetype. The answer -- including "never" -- is remembered, so it asks once per
+machine rather than once per session. Nothing is ever installed without saying
+yes: opening a file from a repository you just cloned should not fetch and run a
+toolchain you did not choose.
+
+`lvim.lsp.automatic.preferred` maps a filetype to candidate servers, best first,
+and ships an opinion for Lua, Python, Rust, TypeScript/JavaScript, TOML, YAML
+and JSON. Override one filetype as above, or replace the table outright:
+
+```lua
+lvim.lsp.automatic.preferred = { rust = { "rust_analyzer" } }
+```
+
+For a filetype with no entry, `lvim.lsp.automatic.unknown_filetypes` decides:
+`"ask"` (the default) offers whatever mason knows about, `"ignore"` stays quiet.
+Set `lvim.lsp.automatic.enabled = false` to turn the whole thing off, or use the
+LunarVim-compatible deny-list to suppress individual servers:
+
+```lua
+lvim.lsp.automatic_configuration.skipped_servers = { "harper_ls" }
+```
+
+`:LvimLspForget` clears remembered answers -- with no argument it forgets every
+filetype, with one (`:LvimLspForget python`) just that one.
 
 Useful commands:
 
@@ -143,6 +175,7 @@ Useful commands:
 | `:LvimReload`           | Reload config, then reapply options, keymaps, and autocmds. |
 | `:LvimUpdate`           | Pull the latest LunaVim (git pull --rebase).      |
 | `:LvimSyncCorePlugins`  | Apply the pinned plugin snapshot.                 |
+| `:LvimLspForget`        | Forget remembered language-server install answers. |
 | `:LvimCacheReset`       | Clear the lazy.nvim cache.                        |
 | `:checkhealth lvim`     | Diagnose install/runtime issues.                  |
 

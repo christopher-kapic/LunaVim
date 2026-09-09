@@ -803,6 +803,60 @@ return {
     capabilities = nil,
     automatic_servers_installation = false,
     diagnostic = {},
+    -- Automatic per-filetype server activation. See `lvim/lsp/automatic.lua`
+    -- for why this is a short preference list rather than the upstream
+    -- LunarVim deny-list.
+    --
+    -- `preferred` maps a filetype to candidate servers, best first. Override
+    -- one filetype without losing the rest:
+    --
+    --   lvim.lsp.automatic.preferred.python = { "pyright" }
+    --   lvim.lsp.automatic.preferred.go = { "gopls" }
+    --
+    -- or replace the table wholesale to opt out of every default:
+    --
+    --   lvim.lsp.automatic.preferred = { rust = { "rust_analyzer" } }
+    --
+    -- Read at call time, so both forms work from `config.lua` and survive
+    -- `:LvimReload`.
+    --
+    -- `unknown_filetypes` decides what happens for a filetype with no entry:
+    -- "ask" offers whatever mason knows about, "ignore" stays silent.
+    --
+    -- Installing always asks first and remembers the answer under
+    -- `<cache>/lsp-automatic/` (one file per filetype); `:LvimLspForget`
+    -- clears it.
+    automatic = {
+      enabled = true,
+      preferred = {
+        lua = { "lua_ls" },
+        python = { "basedpyright", "ruff" },
+        rust = { "rust_analyzer" },
+        typescript = { "vtsls" },
+        typescriptreact = { "vtsls" },
+        javascript = { "vtsls" },
+        javascriptreact = { "vtsls" },
+        toml = { "taplo" },
+        yaml = { "yamlls" },
+        json = { "jsonls" },
+        jsonc = { "jsonls" },
+      },
+      unknown_filetypes = "ask",
+      -- How long a filetype stays "already being handled" before it can be
+      -- offered again. The prompt window covers an abandoned picker; the
+      -- install window is separate and much longer, because a download is not
+      -- an abandoned prompt -- expiring mid-install would let a second prompt
+      -- install a different server for the same filetype.
+      retry_after_seconds = 300,
+      install_timeout_seconds = 1800,
+    },
+    -- LunarVim compatibility. Upstream drove automatic setup off an 83-entry
+    -- deny-list; these still filter the candidate list here, so a config that
+    -- sets them keeps working and "never offer me harper_ls" stays sayable.
+    automatic_configuration = {
+      skipped_servers = {},
+      skipped_filetypes = {},
+    },
     -- Buffer-local LSP mappings, applied by `lvim/lsp/handlers.lua`
     -- `make_on_attach()` to every buffer a server attaches to. Mirrors the
     -- LunarVim contract (`lvim.lsp.buffer_mappings.<mode>`) so a user can
