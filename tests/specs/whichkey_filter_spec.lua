@@ -138,14 +138,19 @@ describe("whichkey filter_mappings", function()
       end
     end
     for _, lhs in ipairs(dropped) do
-      assert.is_true(lhs == "<leader>gg", string.format("unexpectedly dropped %q from the forwarded mapping list", lhs))
+      assert.is_true(
+        lhs == "<leader>gg" or lhs:match("^<leader>d") ~= nil,
+        string.format("unexpectedly dropped %q from the forwarded mapping list", lhs)
+      )
     end
 
     -- The loop above only bounds what MAY be dropped; on its own a filter that
     -- dropped nothing would satisfy it. Assert the gated binding actually was
     -- dropped, so the check fails if filtering stops working entirely.
     assert.is_nil(kept["<leader>gg"], "expected the lazygit binding to be filtered out")
-    assert.is_true(#dropped > 0, "expected filtering to drop the gated binding")
+    assert.is_nil(kept["<leader>dt"], "expected the dap bindings to be filtered out")
+    assert.is_nil(kept["<leader>d"], "expected the emptied Debug group to be dropped")
+    assert.is_true(#dropped > 0, "expected filtering to drop the gated bindings")
   end)
 
   it("does not gate an unrelated binding that merely mentions toggle_lazygit", function()

@@ -469,6 +469,28 @@ return {
     config = setup("lint"),
   },
 
+  -- Debugger. nvim-dap plus its UI; `nvim-nio` is dap-ui's own hard dependency.
+  --
+  -- `lazy = true` with no event: a debugger should cost nothing until asked
+  -- for. The `<leader>d` bindings in the which-key spec all go through
+  -- `require('dap')`, and that require is what trips lazy.nvim's loader on
+  -- first press. `cmd` covers the commands dap registers for direct use.
+  --
+  -- Adapters are not configured here -- see lvim/plugins/modules/dap.lua for
+  -- why a distribution should not guess them.
+  {
+    "mfussenegger/nvim-dap",
+    name = "dap",
+    enabled = gate("dap"),
+    lazy = true,
+    cmd = { "DapContinue", "DapToggleBreakpoint", "DapTerminate", "DapStepOver", "DapStepInto" },
+    dependencies = {
+      { "rcarriga/nvim-dap-ui", dependencies = { "nvim-neotest/nvim-nio" } },
+    },
+    opts = {},
+    config = setup("dap"),
+  },
+
   -- Winbar breadcrumbs via SmiteshP/nvim-navic. Loaded lazily: the LSP
   -- on_attach callback in `lua/lvim/lsp/handlers.lua` calls
   -- `require('nvim-navic')` only after a server attaches AND

@@ -9,7 +9,7 @@
 --     mason-lspconfig exception) drops only that one gate to false while
 --     every sibling gate remains true — proving each entry's wiring is
 --     independent and pointed at the right builtin key,
---   * exactly 17 of the 23 core entries are gated (pinned count guards
+--   * exactly 18 of the 24 core entries are gated (pinned count guards
 --     against a stray gate-removal regression that a loose `> N` floor
 --     would mask),
 --   * `gate()` defensively defaults to "enabled" when `_G.lvim` is nil,
@@ -180,10 +180,7 @@ describe("plugin_spec", function()
       "breadcrumbs",
     }
     for _, name in ipairs(expected_names) do
-      assert.is_true(
-        names_present[name] == true,
-        string.format("expected core spec to include named entry %q", name)
-      )
+      assert.is_true(names_present[name] == true, string.format("expected core spec to include named entry %q", name))
     end
   end)
 
@@ -202,7 +199,7 @@ describe("plugin_spec", function()
         )
       end
     end
-    -- Exact count: 17 gated entries out of 23 total, so 23 = 17 gated + 6
+    -- Exact count: 18 gated entries out of 24 total, so 24 = 18 gated + 6
     -- non-gated. The six non-gated entries are folke/lazy.nvim,
     -- nvim-lua/plenary.nvim, nvim-tree/nvim-web-devicons,
     -- folke/tokyonight.nvim, stevearc/conform.nvim and
@@ -215,7 +212,7 @@ describe("plugin_spec", function()
     -- gated entry without updating this test forces a deliberate touch
     -- here, and conversely a stray gate-removal regression is caught
     -- immediately rather than masked by a loose `> 10` floor.
-    assert.equals(17, gated_count)
+    assert.equals(18, gated_count)
 
     -- Flip telescope off — only telescope's `enabled()` should report
     -- false; sibling gates must still report true.
@@ -240,7 +237,7 @@ describe("plugin_spec", function()
     -- remains true. The "each gated entry's enabled() reflects ..." test
     -- above only flips telescope as a canary; this test exhaustively
     -- iterates every gated entry so the per-key wiring is pinned for
-    -- ALL 17 gates, not just one.
+    -- ALL 18 gates, not just one.
     --
     -- Most gated entries use `enabled = gate(entry.name)`. The documented
     -- exception is mason-lspconfig: its name is "mason-lspconfig" but its
@@ -264,7 +261,7 @@ describe("plugin_spec", function()
     end
 
     local entries = gated_entries()
-    assert.equals(17, #entries)
+    assert.equals(18, #entries)
 
     for _, target in ipairs(entries) do
       local target_key = gate_key_for[target.name] or target.name
@@ -358,10 +355,7 @@ describe("plugin_spec", function()
       if type(entry.enabled) == "function" then
         assert.is_true(
           entry.enabled(),
-          string.format(
-            "expected enabled() to default to true with empty lvim.builtin for %q",
-            entry.name or entry[1]
-          )
+          string.format("expected enabled() to default to true with empty lvim.builtin for %q", entry.name or entry[1])
         )
       end
     end
@@ -478,11 +472,11 @@ describe("plugin_spec", function()
         table.insert(named_targets, entry.name)
       end
     end
-    -- 16 = 17 gated entries minus mason-lspconfig (handled by the
+    -- 17 = 18 gated entries minus mason-lspconfig (handled by the
     -- dedicated cascade test). If this floor moves, update both this
     -- count and the rationale comment above so the exclusion stays
     -- documented.
-    assert.equals(16, #named_targets)
+    assert.equals(17, #named_targets)
 
     local baseline = #plugins.final_spec()
     local baseline_names = names_in(plugins.final_spec())

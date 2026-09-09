@@ -20,4 +20,5 @@ lukas-reineke/indent-blankline.nvim
 stevearc/conform.nvim
 saghen/blink.cmp
 mfussenegger/nvim-lint
+mfussenegger/nvim-dap
 SmiteshP/nvim-navic

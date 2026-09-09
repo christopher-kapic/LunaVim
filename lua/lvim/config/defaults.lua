@@ -275,6 +275,30 @@ return {
         { "<leader>bl", "<cmd>BufferLineCloseRight<cr>", desc = "Close all to the right" },
         { "<leader>bD", "<cmd>BufferLineSortByDirectory<cr>", desc = "Sort by directory" },
         { "<leader>bL", "<cmd>BufferLineSortByExtension<cr>", desc = "Sort by language" },
+        -- Debug (nvim-dap). Each rhs resolves `require('dap')` at press
+        -- time, which is what loads the lazily-specced plugin on first use.
+        -- The which-key module filters the whole group out when nvim-dap is
+        -- not installed, so a user who disabled the builtin does not get a
+        -- popup row that errors on press.
+        { "<leader>d", group = "Debug" },
+        { "<leader>dt", "<cmd>lua require'dap'.toggle_breakpoint()<cr>", desc = "Toggle Breakpoint" },
+        { "<leader>db", "<cmd>lua require'dap'.step_back()<cr>", desc = "Step Back" },
+        { "<leader>dc", "<cmd>lua require'dap'.continue()<cr>", desc = "Continue" },
+        { "<leader>dC", "<cmd>lua require'dap'.run_to_cursor()<cr>", desc = "Run To Cursor" },
+        { "<leader>dd", "<cmd>lua require'dap'.disconnect()<cr>", desc = "Disconnect" },
+        { "<leader>dg", "<cmd>lua require'dap'.session()<cr>", desc = "Get Session" },
+        { "<leader>di", "<cmd>lua require'dap'.step_into()<cr>", desc = "Step Into" },
+        { "<leader>do", "<cmd>lua require'dap'.step_over()<cr>", desc = "Step Over" },
+        { "<leader>du", "<cmd>lua require'dap'.step_out()<cr>", desc = "Step Out" },
+        { "<leader>dp", "<cmd>lua require'dap'.pause()<cr>", desc = "Pause" },
+        { "<leader>dr", "<cmd>lua require'dap'.repl.toggle()<cr>", desc = "Toggle Repl" },
+        { "<leader>ds", "<cmd>lua require'dap'.continue()<cr>", desc = "Start" },
+        { "<leader>dq", "<cmd>lua require'dap'.close()<cr>", desc = "Quit" },
+        -- Routed through LunaVim's dap module, not `require('dapui')` directly:
+        -- dap-ui is a dependency of the nvim-dap spec, so requiring it on its
+        -- own loads dap-ui WITHOUT running the parent spec's config callback
+        -- where `dapui.setup()` lives.
+        { "<leader>dU", "<cmd>lua require('lvim.plugins.modules.dap').toggle_ui()<cr>", desc = "Toggle UI" },
         -- Plugins (lazy.nvim subcommands)
         { "<leader>p", group = "Plugins" },
         { "<leader>pi", "<cmd>Lazy install<cr>", desc = "Install" },
@@ -419,6 +443,33 @@ return {
     -- by the module and is not exposed for user override here; Phase 6 may
     -- extend the surface if needed.
     comment = { active = true, options = {} },
+    -- Debugger (nvim-dap + nvim-dap-ui). Consumed by
+    -- `lvim/plugins/modules/dap.lua`.
+    --
+    -- `signs` are applied with `vim.fn.sign_define`; dap has no setup() options
+    -- table, so its real configuration surface is `dap.adapters` and
+    -- `dap.configurations`, which a user populates directly. `ui` is forwarded
+    -- verbatim to `require('dapui').setup`. `auto_open` opens the UI when a
+    -- session starts and closes it when the session ends; set it false to drive
+    -- the panels manually with `<leader>dU`.
+    dap = {
+      active = true,
+      auto_open = true,
+      signs = {
+        DapBreakpoint = { text = "●", texthl = "DiagnosticSignError" },
+        DapBreakpointCondition = { text = "◆", texthl = "DiagnosticSignWarn" },
+        DapLogPoint = { text = "◆", texthl = "DiagnosticSignInfo" },
+        DapStopped = { text = "▶", texthl = "DiagnosticSignWarn", linehl = "Visual" },
+        DapBreakpointRejected = { text = "○", texthl = "DiagnosticSignHint" },
+      },
+      ui = {},
+      -- Adapter and per-filetype configuration tables, merged into
+      -- `dap.adapters` / `dap.configurations` by the module. Declared here
+      -- rather than set via `require("dap")` in config.lua, because user config
+      -- runs before lazy.nvim exists -- see the module header.
+      adapters = {},
+      configurations = {},
+    },
     -- Completion, via Saghen/blink.cmp. The whole subtree (minus `active`) is
     -- forwarded to `require("blink.cmp").setup(opts)` by
     -- `lvim/plugins/modules/cmp.lua`.

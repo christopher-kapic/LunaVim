@@ -335,6 +335,15 @@ local function lvim_reload()
   -- and stays out of the way entirely when it was never loaded.
   require("lvim.plugins.modules.lint").setup({})
 
+  -- Reconcile nvim-dap the same way, but only if it is already loaded. The
+  -- module reconciles its dapui listeners on each pass, so a user who turns
+  -- `lvim.builtin.dap.auto_open` off and reloads actually stops the UI opening
+  -- itself. Gated on `package.loaded` so a reload never drags the debugger in
+  -- for a session that has not used it.
+  if package.loaded["dap"] then
+    require("lvim.plugins.modules.dap").setup({})
+  end
+
   vim.notify("LvimReload OK", vim.log.levels.INFO)
 end
 

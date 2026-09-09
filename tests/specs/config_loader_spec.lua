@@ -106,11 +106,11 @@ describe("config_loader", function()
     assert.is_nil(_G.lvim.lang)
     assert.is_nil(_G.lvim.log)
 
-    -- Same for the four builtin toggles that promised features nothing
-    -- implemented. `lvim.builtin.dap.active = true` claimed a debugger that was
-    -- never installed; the toggle is re-added by the commit that adds the
-    -- plugin behind it.
-    for _, key in ipairs({ "dap", "illuminate", "lir", "project" }) do
+    -- Toggles are only legitimate alongside an implementation. `dap` is back
+    -- because nvim-dap now ships with it; the rest stay absent until the same
+    -- is true of them. `lir` is gone for good -- nvim-tree owns that role.
+    assert.is_table(_G.lvim.builtin.dap)
+    for _, key in ipairs({ "illuminate", "lir", "project" }) do
       assert.is_nil(_G.lvim.builtin[key], "lvim.builtin." .. key .. " should not exist without an implementation")
     end
     assert.is_table(_G.lvim.keys)
