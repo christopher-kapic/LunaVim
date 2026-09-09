@@ -173,6 +173,27 @@ make_sample_config_dir() {
 }
 
 # ---------------------------------------------------------------------------
+# What lives here, and what does not
+# ---------------------------------------------------------------------------
+#
+# A check belongs in this script when it needs a real Neovim process: a full
+# `lvim.start()`, a `bin/lvim` launch, a fresh `$LUNAVIM_RUNTIME_DIR`, a
+# version-specific startup path. That is what bash buys here, and nothing else
+# in this file does.
+#
+# Purely textual contracts -- "this module exists", "it requires that plugin",
+# "init.lua still wires in this setup()" -- were greps inside bash functions,
+# paying for the shell without using it. They now live in
+# `tests/specs/source_contract_spec.lua`, run by `make test` below. Moving them
+# also fixed a defect they had carried since they were written: grepping whole
+# files, several matched a header COMMENT documenting the dispatch rather than
+# the code performing it, and stayed green when the dispatch was removed. The
+# spec versions blank out comments and long strings before matching, and tie
+# each `setup()` call back to the handle the module actually required.
+#
+# Add textual contracts there. Add runtime contracts here.
+
+# ---------------------------------------------------------------------------
 # Fail collection
 # ---------------------------------------------------------------------------
 #
@@ -1260,23 +1281,6 @@ check_min_nvim_version_error() {
   fi
 }
 
-check_phase_24_snapshot_artifacts_present() {
-  # Phase 2.4 acceptance: the snapshot file, its README, and the maintainer
-  # export helper must all be present, with the script marked executable.
-  if [[ ! -f snapshots/default.json ]]; then
-    printf 'phase 2.4: snapshots/default.json is missing\n' >&2
-    return 1
-  fi
-  if [[ ! -f snapshots/README.md ]]; then
-    printf 'phase 2.4: snapshots/README.md is missing\n' >&2
-    return 1
-  fi
-  if [[ ! -x scripts/snapshot-export.sh ]]; then
-    printf 'phase 2.4: scripts/snapshot-export.sh is missing or not executable\n' >&2
-    return 1
-  fi
-}
-
 check_phase_24_lvim_sync_core_plugins_initial_no_error() {
   # Phase 2.4 acceptance: literal invocation (no bang) must not error.
   #
@@ -1751,20 +1755,6 @@ LUA
   fi
 }
 
-check_phase_32_setup_wired_in_init() {
-  # Phase 3.2 step 5 wires `require('lvim.core.keymaps').setup()` into
-  # `lvim.start()`. The literal-acceptance check above proves leader+maparg
-  # state holds after a full boot, but cannot distinguish "setup() ran from
-  # init.lua" from "setup() ran from some autocmd". Read the file directly
-  # to pin the wiring location: the require line must be present in
-  # `lua/lvim/init.lua`. A regression that drops the wiring would still pass
-  # an "is the file present" check but fail this one.
-  if ! grep -Fq 'require("lvim.core.keymaps").setup()' lua/lvim/init.lua; then
-    printf 'phase 3.2: lvim/init.lua does not call lvim.core.keymaps.setup()\n' >&2
-    return 1
-  fi
-}
-
 check_phase_33_file_opened_fires_once() {
   # Phase 3.3 literal acceptance: opening a real file must fire
   # `User FileOpened` exactly once, and the per-buffer guard
@@ -2023,18 +2013,6 @@ check_phase_33_trailing_whitespace_toggle() {
   if [[ "$size_on" != "8" ]]; then
     printf 'phase 3.3: with the toggle on, trailing spaces not stripped (expected 8 bytes, got %s)\n' \
       "$size_on" >&2
-    return 1
-  fi
-}
-
-check_phase_33_setup_wired_in_init() {
-  # Phase 3.3 step 5 wires `require('lvim.core.autocmds').setup()` into
-  # `lvim.start()`. Pin the wiring at the file level so a regression that
-  # drops the require (so the User FileOpened/DirOpened events never get
-  # an emitter, and every plugin spec keyed on those events silently
-  # stops triggering) is caught before the runtime checks above.
-  if ! grep -Fq 'require("lvim.core.autocmds").setup()' lua/lvim/init.lua; then
-    printf 'phase 3.3: lvim/init.lua does not call lvim.core.autocmds.setup()\n' >&2
     return 1
   fi
 }
@@ -2410,19 +2388,6 @@ check_phase_41_lsp_setup_idempotent() {
   if ! grep -q '^MASON=1 MLC=1$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.1: lvim.lsp.setup() not idempotent — mason/mason-lspconfig setup re-ran (output: %s)\n' \
       "$output" >&2
-    return 1
-  fi
-}
-
-check_phase_41_setup_wired_in_init() {
-  # Phase 4.1 step 4 wires `require('lvim.lsp').setup()` into
-  # `lvim.start()`. Pin the wiring location at the file level so a
-  # regression that drops the require (so neither mason nor lspconfig
-  # ever get setup() called on a fresh real-user boot — the lazy config
-  # callbacks on mason/mason-lspconfig are no-op stubs by design) is
-  # caught before the runtime stub checks above.
-  if ! grep -Fq 'require("lvim.lsp").setup()' lua/lvim/init.lua; then
-    printf 'phase 4.1: lvim/init.lua does not call lvim.lsp.setup()\n' >&2
     return 1
   fi
 }
@@ -2860,26 +2825,6 @@ LUA
   fi
 }
 
-check_phase_42_handlers_module_present() {
-  # Phase 4.2 step 3 creates `lua/lvim/lsp/handlers.lua` exporting
-  # `make_capabilities()` and `make_on_attach()`. Pin the module location at
-  # the file level so a regression that moved/renamed/dropped the file (so
-  # the orchestrator's `require('lvim.lsp.handlers')` would fail) is caught
-  # before the runtime checks above.
-  if [[ ! -f lua/lvim/lsp/handlers.lua ]]; then
-    printf 'phase 4.2: lua/lvim/lsp/handlers.lua is missing\n' >&2
-    return 1
-  fi
-  if ! grep -Fq 'function M.make_capabilities' lua/lvim/lsp/handlers.lua; then
-    printf 'phase 4.2: handlers.lua missing make_capabilities export\n' >&2
-    return 1
-  fi
-  if ! grep -Fq 'function M.make_on_attach' lua/lvim/lsp/handlers.lua; then
-    printf 'phase 4.2: handlers.lua missing make_on_attach export\n' >&2
-    return 1
-  fi
-}
-
 check_phase_42_uses_vim_lsp_config_not_setup() {
   # Phase 4 acceptance criterion (plan.md §"Phase 4 Acceptance"):
   # "Deprecated LSP API warnings are absent on the supported Neovim version."
@@ -2984,25 +2929,6 @@ LUA
   if ! grep -q '^INDEX_COUNT=0$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.2: orchestrator indexed lspconfig module (would trigger vim.deprecate on Neovim 0.11+) (output: %s)\n' \
       "$output" >&2
-    return 1
-  fi
-}
-
-check_phase_43_format_module_present() {
-  # Phase 4.3 lives in lua/lvim/lsp/format.lua. Pin the file's location and
-  # public surface at the file level so a regression that moved/renamed the
-  # module (so lvim.start()'s `require("lvim.lsp.format")` would error) is
-  # caught before the runtime probes below.
-  if [[ ! -f lua/lvim/lsp/format.lua ]]; then
-    printf 'phase 4.3: lua/lvim/lsp/format.lua is missing\n' >&2
-    return 1
-  fi
-  if ! grep -Fq 'function M.setup' lua/lvim/lsp/format.lua; then
-    printf 'phase 4.3: format.lua missing M.setup export\n' >&2
-    return 1
-  fi
-  if ! grep -Fq 'lvim_format_on_save' lua/lvim/lsp/format.lua; then
-    printf 'phase 4.3: format.lua does not register augroup lvim_format_on_save\n' >&2
     return 1
   fi
 }
@@ -3263,21 +3189,6 @@ check_phase_43_table_form_timeout_ms_flows_through() {
   fi
 }
 
-check_phase_44_lazydev_module_present() {
-  # Phase 4.4 lives in lua/lvim/plugins/modules/lazydev.lua. Pin the file's
-  # presence at the file level so a regression that moves/renames the module
-  # (breaking the spec's `config = setup("lazydev")` dispatch) is caught
-  # before the runtime probes below.
-  if [[ ! -f lua/lvim/plugins/modules/lazydev.lua ]]; then
-    printf 'phase 4.4: lua/lvim/plugins/modules/lazydev.lua is missing\n' >&2
-    return 1
-  fi
-  if ! grep -Eq 'require[(,][[:space:]]*["'"'"']lazydev["'"'"']' lua/lvim/plugins/modules/lazydev.lua; then
-    printf 'phase 4.4: lazydev module does not require the lazydev plugin\n' >&2
-    return 1
-  fi
-}
-
 check_phase_44_lazydev_setup_library_defaults() {
   # Phase 4.4 acceptance: lazydev.setup() must receive a `library` array
   # containing at least `vim.env.VIMRUNTIME` and the lvim base dir, so editing
@@ -3417,55 +3328,6 @@ check_phase_44_lazydev_loads_on_lua_ft() {
     -c 'qall!' 2>&1)"
   if ! grep -Eq '^FT_LOAD[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.4: lazydev did not load on FileType lua (output: %s)\n' "$output" >&2
-    return 1
-  fi
-}
-
-check_phase_44_lspconfig_does_not_set_lua_workspace_library() {
-  # Per kcl, lazydev is the recommended integration and dynamically injects
-  # paths into the active lua_ls client's settings at runtime. The orchestrator
-  # must NOT also set `Lua.workspace.library` on lua_ls (in the per-server
-  # config flow inside `lua/lvim/lsp/init.lua`) — a static library entry there
-  # would shadow / conflict with lazydev's runtime injection. Grep the LSP
-  # orchestrator and the defaults to prove no static `workspace.library` is
-  # hardcoded; user config can still set one in `lvim.lsp.servers.lua_ls`,
-  # which is by design.
-  #
-  # The pattern matches a workspace SETTING — `workspace.library`, or
-  # `workspace` as a table key — rather than the bare word. Matching the bare
-  # word made this check fire on
-  # `<cmd>Telescope lsp_dynamic_workspace_symbols<cr>` in the which-key spec,
-  # a picker name that has nothing to do with lua_ls settings.
-  local ws_pattern='workspace[[:space:]]*\.[[:space:]]*library|["'"'"']?workspace["'"'"']?[[:space:]]*=|\[["'"'"']workspace["'"'"']\]'
-  if grep -Eq "$ws_pattern" lua/lvim/lsp/init.lua 2>/dev/null; then
-    printf 'phase 4.4: lua/lvim/lsp/init.lua hardcodes a workspace setting (conflicts with lazydev)\n' >&2
-    return 1
-  fi
-  if grep -Eq "$ws_pattern" lua/lvim/lsp/handlers.lua 2>/dev/null; then
-    printf 'phase 4.4: lua/lvim/lsp/handlers.lua hardcodes a workspace setting (conflicts with lazydev)\n' >&2
-    return 1
-  fi
-  if grep -Eq "$ws_pattern" lua/lvim/config/defaults.lua 2>/dev/null; then
-    printf 'phase 4.4: lua/lvim/config/defaults.lua hardcodes a workspace setting (conflicts with lazydev)\n' >&2
-    return 1
-  fi
-}
-
-check_phase_45_diagnostics_module_present() {
-  # Phase 4.5 lives in lua/lvim/lsp/diagnostics.lua. Pin the file's presence
-  # so a regression that moves/renames the module (breaking the orchestrator's
-  # `require("lvim.lsp.diagnostics").setup()` dispatch) fails before the
-  # runtime probes below try to observe its effects.
-  if [[ ! -f lua/lvim/lsp/diagnostics.lua ]]; then
-    printf 'phase 4.5: lua/lvim/lsp/diagnostics.lua is missing\n' >&2
-    return 1
-  fi
-  if ! grep -F 'vim.diagnostic.config' lua/lvim/lsp/diagnostics.lua >/dev/null; then
-    printf 'phase 4.5: diagnostics module does not call vim.diagnostic.config\n' >&2
-    return 1
-  fi
-  if ! grep -F 'sign_define' lua/lvim/lsp/diagnostics.lua >/dev/null; then
-    printf 'phase 4.5: diagnostics module does not call vim.fn.sign_define\n' >&2
     return 1
   fi
 }
@@ -3664,20 +3526,6 @@ check_phase_45_user_overrides_merged() {
     -c 'qall!' 2>&1)"
   if ! grep -Eq '^OVR[[:space:]]+true[[:space:]]+true[[:space:]]+single[[:space:]]+always$' <<<"${output//$'\r'/}"; then
     printf 'phase 4.5: user diagnostic overrides did not deep-merge with defaults (output: %s)\n' "$output" >&2
-    return 1
-  fi
-}
-
-check_phase_45_setup_wired_in_orchestrator() {
-  # Phase 4.5 wires `require("lvim.lsp.diagnostics").setup()` into the
-  # `lvim.lsp.setup()` orchestrator. A regression that removed the require —
-  # leaving the diagnostics defaults un-applied because nothing else calls
-  # them — would be caught by the literal-acceptance check above only if the
-  # orchestrator itself still ran (e.g. in headless boot). Grep the
-  # orchestrator file directly so the wiring is observable at the source
-  # level too.
-  if ! grep -F "require(\"lvim.lsp.diagnostics\").setup()" lua/lvim/lsp/init.lua >/dev/null; then
-    printf 'phase 4.5: lvim.lsp.setup() does not wire in lvim.lsp.diagnostics.setup()\n' >&2
     return 1
   fi
 }
@@ -3994,23 +3842,6 @@ check_phase_51_setup_does_not_mutate_builtin() {
   fi
 }
 
-check_phase_52_comment_module_calls_mini_setup() {
-  # Phase 5.2 lives in lua/lvim/plugins/modules/comment.lua. Pin both the
-  # file's presence and that it dispatches into `require('mini.comment').setup`
-  # — a regression that left the Phase 0 stub in place (or that switched to
-  # the disallowed umbrella `require('mini').setup`) would silently skip the
-  # commentstring hook.
-  if [[ ! -f lua/lvim/plugins/modules/comment.lua ]]; then
-    printf 'phase 5.2: lua/lvim/plugins/modules/comment.lua is missing\n' >&2
-    return 1
-  fi
-  if ! grep -Eq "require\\(['\"]mini\\.comment['\"]\\)\\.setup" \
-        lua/lvim/plugins/modules/comment.lua; then
-    printf 'phase 5.2: comment module does not call require("mini.comment").setup\n' >&2
-    return 1
-  fi
-}
-
 check_phase_52_comment_defaults_shape() {
   # Phase 5.2 step 3 prescribes the defaults verbatim:
   #   lvim.builtin.comment = { active = true, options = {} }
@@ -4297,21 +4128,6 @@ check_phase_52_pre_hook_does_not_touch_non_jsx_filetype_on_non_jsx_node() {
   fi
 }
 
-check_phase_52_sample_tsx_fixture_present() {
-  # The literal acceptance command from the step description reads
-  # `tests/fixtures/sample.tsx`. Pin its presence and prescribed content
-  # so a regression that deletes/renames it (or replaces its body) is
-  # caught here rather than at the acceptance command's grep -F '{/*'.
-  if [[ ! -f tests/fixtures/sample.tsx ]]; then
-    printf 'phase 5.2: tests/fixtures/sample.tsx is missing\n' >&2
-    return 1
-  fi
-  if ! grep -Fxq 'const x = 1;' tests/fixtures/sample.tsx; then
-    printf 'phase 5.2: tests/fixtures/sample.tsx does not contain the prescribed body\n' >&2
-    return 1
-  fi
-}
-
 check_phase_52_acceptance_command_literal() {
   # Phase 5.2 step description states a literal acceptance command (in
   # addition to the smoke exiting 0):
@@ -4358,17 +4174,6 @@ check_phase_52_acceptance_command_literal() {
     -c 'qall!' 2>&1)"
   if ! grep -Fq 'RESULT={/*' <<<"${output//$'\r'/}"; then
     printf 'phase 5.2 literal acceptance: Vgcc on sample.tsx did not wrap the line in JSX comment (output: %s)\n' "$output" >&2
-    return 1
-  fi
-}
-
-check_phase_53_commands_lua_calls_tsupdate() {
-  # Phase 5.3 literal acceptance grep: `:LvimSyncCorePlugins` must
-  # mention TSUpdate. This is the cheapest acceptance signal — if a
-  # future refactor renames or drops the schedule_tsupdate plumbing it
-  # will fail here before any behavioral check has to fire.
-  if ! grep -q 'TSUpdate' lua/lvim/core/commands.lua; then
-    printf 'phase 5.3: lua/lvim/core/commands.lua does not reference TSUpdate\n' >&2
     return 1
   fi
 }
@@ -4545,23 +4350,6 @@ check_phase_53_tsupdate_error_does_not_abort_sync() {
       printf 'phase 5.3: TSUpdate ran despite the tree-sitter CLI being absent (output: %s)\n' "$output" >&2
       return 1
     fi
-  fi
-}
-
-check_phase_6_telescope_module_present() {
-  # Phase 6 telescope module: pin the file's presence AND that it dispatches
-  # into `require('telescope').setup(...)`. A regression that left the Phase 0
-  # stub in place would silently drop user `lvim.builtin.telescope` config on
-  # the floor (the spec gate would still load the plugin, but its `config`
-  # callback would be a no-op).
-  if [[ ! -f lua/lvim/plugins/modules/telescope.lua ]]; then
-    printf 'phase 6 telescope: lua/lvim/plugins/modules/telescope.lua is missing\n' >&2
-    return 1
-  fi
-  if ! grep -Eq "require\\(['\"]telescope['\"]\\)\\.setup" \
-        lua/lvim/plugins/modules/telescope.lua; then
-    printf 'phase 6 telescope: module does not call require("telescope").setup\n' >&2
-    return 1
   fi
 }
 
@@ -5118,23 +4906,6 @@ check_phase_6_telescope_toggle_drops_telescope_specifically() {
   fi
 }
 
-check_phase_6_lualine_module_present() {
-  # Phase 6 lualine module: pin the file's presence AND that it dispatches
-  # into `require('lualine').setup(...)`. A regression that left the Phase 0
-  # stub in place would silently drop user `lvim.builtin.lualine` config on
-  # the floor (the spec gate would still load the plugin, but its `config`
-  # callback would be a no-op).
-  if [[ ! -f lua/lvim/plugins/modules/lualine.lua ]]; then
-    printf 'phase 6 lualine: lua/lvim/plugins/modules/lualine.lua is missing\n' >&2
-    return 1
-  fi
-  if ! grep -Eq "require\\(['\"]lualine['\"]\\)\\.setup" \
-        lua/lvim/plugins/modules/lualine.lua; then
-    printf 'phase 6 lualine: module does not call require("lualine").setup\n' >&2
-    return 1
-  fi
-}
-
 check_phase_6_lualine_defaults_shape() {
   # Phase 6 step 1 prescribes the defaults subtree shape:
   #   { active = true, options = { theme, section_separators,
@@ -5349,23 +5120,6 @@ check_phase_6_lualine_toggle_drops_lualine_specifically() {
     -c 'qall!' 2>&1)"
   if ! grep -Eq '^LL=false$' <<<"${toggled_out//$'\r'/}"; then
     printf 'phase 6 lualine toggle: nvim-lualine/lualine.nvim still present in Config.plugins with lualine.active=false (output: %s)\n' "$toggled_out" >&2
-    return 1
-  fi
-}
-
-check_phase_6_bufferline_module_present() {
-  # Phase 6 bufferline module: pin the file's presence AND that it dispatches
-  # into `require('bufferline').setup(...)`. A regression that left the Phase 0
-  # stub in place would silently drop user `lvim.builtin.bufferline` config on
-  # the floor (the spec gate would still load the plugin, but its `config`
-  # callback would be a no-op).
-  if [[ ! -f lua/lvim/plugins/modules/bufferline.lua ]]; then
-    printf 'phase 6 bufferline: lua/lvim/plugins/modules/bufferline.lua is missing\n' >&2
-    return 1
-  fi
-  if ! grep -Eq "require\\(['\"]bufferline['\"]\\)\\.setup" \
-        lua/lvim/plugins/modules/bufferline.lua; then
-    printf 'phase 6 bufferline: module does not call require("bufferline").setup\n' >&2
     return 1
   fi
 }
@@ -5586,23 +5340,6 @@ check_phase_6_bufferline_defaults_offsets_full_list() {
     -c 'qall!' 2>&1)"
   if ! grep -Eq '^OFFLEN[[:space:]]+1[[:space:]]+NvimTree[[:space:]]+File Explorer[[:space:]]+Directory[[:space:]]+left$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 bufferline: offsets list length or contents misaligned (output: %s)\n' "$output" >&2
-    return 1
-  fi
-}
-
-check_phase_6_gitsigns_module_present() {
-  # Phase 6 gitsigns module: pin the file's presence AND that it dispatches
-  # into `require('gitsigns').setup(...)`. A regression that left the Phase 0
-  # stub in place would silently drop user `lvim.builtin.gitsigns` config on
-  # the floor (the spec gate would still load the plugin, but its `config`
-  # callback would be a no-op).
-  if [[ ! -f lua/lvim/plugins/modules/gitsigns.lua ]]; then
-    printf 'phase 6 gitsigns: lua/lvim/plugins/modules/gitsigns.lua is missing\n' >&2
-    return 1
-  fi
-  if ! grep -Eq "require\\(['\"]gitsigns['\"]\\)\\.setup" \
-        lua/lvim/plugins/modules/gitsigns.lua; then
-    printf 'phase 6 gitsigns: module does not call require("gitsigns").setup\n' >&2
     return 1
   fi
 }
@@ -5845,34 +5582,6 @@ check_phase_6_gitsigns_defaults_signs_staged_per_status() {
     -c 'qall!' 2>&1)"
   if ! grep -Eq '^SIGNS_STAGED[[:space:]]+┃[[:space:]]+┃[[:space:]]+_[[:space:]]+‾[[:space:]]+~[[:space:]]+┆$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 gitsigns: signs_staged per-status shape misaligned (output: %s)\n' "$output" >&2
-    return 1
-  fi
-}
-
-check_phase_6_whichkey_module_present() {
-  # Phase 6 whichkey module: pin the file's presence AND that it dispatches
-  # into both `require('which-key').setup(...)` AND `require('which-key').add(...)`.
-  # A regression that left the Phase 0 stub in place would silently drop user
-  # `lvim.builtin.whichkey` config on the floor (the spec gate would still load
-  # the plugin, but its `config` callback would be a no-op and no leader groups
-  # would be registered). v3 of which-key deprecated `register()` in favor of
-  # `add()`; this check also pins the v3 entrypoint so a regression that fell
-  # back to the deprecated dictionary form would surface here.
-  if [[ ! -f lua/lvim/plugins/modules/whichkey.lua ]]; then
-    printf 'phase 6 whichkey: lua/lvim/plugins/modules/whichkey.lua is missing\n' >&2
-    return 1
-  fi
-  if ! grep -Eq "require\\(['\"]which-key['\"]\\)\\.setup" \
-        lua/lvim/plugins/modules/whichkey.lua; then
-    printf 'phase 6 whichkey: module does not call require("which-key").setup\n' >&2
-    return 1
-  fi
-  if ! grep -Eq "\\.add\\(" lua/lvim/plugins/modules/whichkey.lua; then
-    printf 'phase 6 whichkey: module does not call which-key.add (v3 API)\n' >&2
-    return 1
-  fi
-  if grep -Eq "\\.register\\(" lua/lvim/plugins/modules/whichkey.lua; then
-    printf 'phase 6 whichkey: module uses deprecated which-key.register() (v3 deprecated this in favor of add())\n' >&2
     return 1
   fi
 }
@@ -6142,23 +5851,6 @@ check_phase_6_whichkey_defaults_mappings_full_list() {
     -c 'qall!' 2>&1)"
   if ! grep -Eq '^WK_MAPS[[:space:]]+true[[:space:]]+0[[:space:]]+0[[:space:]]*$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 whichkey: mappings list has duplicate or malformed entries (output: %s)\n' "$output" >&2
-    return 1
-  fi
-}
-
-check_phase_6_terminal_module_present() {
-  # Phase 6 toggleterm module: pin the file's presence AND that it dispatches
-  # into `require('toggleterm').setup(...)`. A regression that left the Phase 0
-  # stub in place would silently drop user `lvim.builtin.terminal` config on
-  # the floor (the spec gate would still load the plugin, but its `config`
-  # callback would be a no-op).
-  if [[ ! -f lua/lvim/plugins/modules/terminal.lua ]]; then
-    printf 'phase 6 terminal: lua/lvim/plugins/modules/terminal.lua is missing\n' >&2
-    return 1
-  fi
-  if ! grep -Eq "require\\(['\"]toggleterm['\"]\\)\\.setup" \
-        lua/lvim/plugins/modules/terminal.lua; then
-    printf 'phase 6 terminal: module does not call require("toggleterm").setup\n' >&2
     return 1
   fi
 }
@@ -6619,11 +6311,11 @@ check_phase_6_comment_module_dispatches_through_mini_comment_require() {
   # the library explicitly disallows, see
   # https://github.com/echasnovski/mini.nvim) and not any other submodule.
   #
-  # The static sibling `check_phase_52_comment_module_calls_mini_setup` greps
-  # the source for `require('mini.comment').setup`, which catches a literal
-  # textual change but a future refactor that built the module name dynamically
-  # (e.g. `local m = "mini"; require(m).setup(...)`) would silently bypass the
-  # grep. Pin the runtime behavior here: install a `package.preload` shim that
+  # The static sibling lives in `tests/specs/source_contract_spec.lua`, which
+  # reads the source for a `mini.comment` require -- that catches a literal
+  # textual change, but a future refactor that built the module name
+  # dynamically (e.g. `local m = "mini"; require(m).setup(...)`) would slip
+  # past it. Pin the runtime behavior here: install a `package.preload` shim that
   # records when `mini.comment` is required, clear any preceding `package.loaded`
   # entry to force the preload to fire, then drive the module via its public
   # `setup({})` entrypoint. The shim must observably run AND `mini.comment.setup`
@@ -6993,31 +6685,6 @@ print('ICONS_NV', n, #missing, table.concat(missing, ','))" \
     -c 'qall!' 2>&1)"
   if ! grep -Eq '^ICONS_NV[[:space:]]+26[[:space:]]+0[[:space:]]*$' <<<"${output//$'\r'/}"; then
     printf 'phase 6 breadcrumbs: defaults.options.icons must be the prescribed 26-kind map with non-empty string glyphs (output: %s)\n' "$output" >&2
-    return 1
-  fi
-}
-
-check_phase_6_indentlines_module_present() {
-  # Phase 6 indent-blankline module: pin the file's presence AND that it
-  # dispatches into `require('ibl').setup(...)`. v3 of indent-blankline
-  # renamed the module from `indent_blankline` to `ibl`; v2's
-  # `require('indent_blankline')` now errors with a hard migration message.
-  # A regression that left a Phase 0 stub in place — or one that resurrected
-  # the v2 require — would silently drop user `lvim.builtin.indentlines.options`
-  # on the floor (the spec gate would still load the plugin, but its `config`
-  # callback would be a no-op or would raise).
-  if [[ ! -f lua/lvim/plugins/modules/indentlines.lua ]]; then
-    printf 'phase 6 indentlines: lua/lvim/plugins/modules/indentlines.lua is missing\n' >&2
-    return 1
-  fi
-  if ! grep -Eq "require[[:space:]]*\\(?['\"]ibl['\"]\\)?[[:space:]]*\\.?[[:space:]]*\\)?[[:space:]]*\\.setup|require\\(['\"]ibl['\"]\\)\\.setup" \
-        lua/lvim/plugins/modules/indentlines.lua; then
-    printf 'phase 6 indentlines: module does not call require("ibl").setup\n' >&2
-    return 1
-  fi
-  if grep -vE '^[[:space:]]*--' lua/lvim/plugins/modules/indentlines.lua \
-       | grep -Eq "require[[:space:]]*\\(?['\"]indent_blankline['\"]"; then
-    printf 'phase 6 indentlines: module still references the v2 require("indent_blankline") (must be require("ibl"))\n' >&2
     return 1
   fi
 }
@@ -7494,7 +7161,6 @@ run_check check_phase_23_lvim_cache_reset_clears_dir
 run_check check_phase_23_lvim_reload_reapplies_config
 run_check check_phase_23_lvim_sync_core_plugins_dispatches
 run_check check_phase_23_acceptance_commands_literal
-run_check check_phase_24_snapshot_artifacts_present
 run_check check_phase_24_lvim_sync_core_plugins_initial_no_error
 run_check check_phase_24_non_empty_snapshot_restores
 run_check check_phase_24_snapshot_export_script_copies_lockfile
@@ -7505,7 +7171,6 @@ run_check check_phase_32_acceptance_commands_literal
 run_check check_phase_32_space_leader_translation
 run_check check_phase_32_default_maps_registered
 run_check check_phase_32_user_keys_override_applied
-run_check check_phase_32_setup_wired_in_init
 run_check check_phase_33_file_opened_fires_once
 run_check check_phase_33_file_opened_skipped_on_empty_buffer
 run_check check_phase_33_dir_opened_fires_when_listener_registered
@@ -7513,7 +7178,6 @@ run_check check_phase_33_dir_opened_re_emits_originating_event
 run_check check_phase_33_file_opened_fires_on_new_file
 run_check check_phase_33_file_opened_fires_once_per_session
 run_check check_phase_33_trailing_whitespace_toggle
-run_check check_phase_33_setup_wired_in_init
 run_check check_phase_34_lvim_reload_reapplies_keymaps
 run_check check_phase_34_lvim_reload_reapplies_options
 run_check check_phase_34_lvim_reload_rearms_autocmds
@@ -7522,7 +7186,6 @@ run_check check_phase_34_lvim_reload_literal_acceptance
 run_check check_phase_34_keymaps_setup_idempotent
 run_check check_phase_41_lsp_setup_orchestration
 run_check check_phase_41_lsp_setup_idempotent
-run_check check_phase_41_setup_wired_in_init
 run_check check_phase_41_mason_toggle_skips_setup
 run_check check_phase_42_defaults_table_present
 run_check check_phase_42_user_settings_flow_through
@@ -7537,11 +7200,9 @@ run_check check_phase_42_empty_servers_no_setup_calls
 run_check check_phase_42_blink_cmp_extends_capabilities
 run_check check_phase_42_automatic_servers_installation_wired
 run_check check_phase_42_ensure_installed_wired
-run_check check_phase_42_handlers_module_present
 run_check check_phase_42_uses_vim_lsp_config_not_setup
 run_check check_phase_42_vim_lsp_enable_called_for_each_server
 run_check check_phase_42_orchestrator_does_not_index_lspconfig
-run_check check_phase_43_format_module_present
 run_check check_phase_43_true_registers_autocmd
 run_check check_phase_43_false_no_autocmd
 run_check check_phase_43_table_form_honored
@@ -7552,14 +7213,11 @@ run_check check_phase_43_table_without_enabled_is_disabled
 run_check check_phase_43_true_normalizes_timeout_ms
 run_check check_phase_43_table_form_timeout_ms_flows_through
 run_check check_phase_43_resetup_drains_augroup_when_disabled
-run_check check_phase_44_lazydev_module_present
 run_check check_phase_44_lazydev_setup_library_defaults
 run_check check_phase_44_lazydev_setup_user_opts_merged
 run_check check_phase_44_lazydev_setup_pcall_guards_missing
 run_check check_phase_44_lazydev_literal_acceptance
 run_check check_phase_44_lazydev_loads_on_lua_ft
-run_check check_phase_44_lspconfig_does_not_set_lua_workspace_library
-run_check check_phase_45_diagnostics_module_present
 run_check check_phase_45_diagnostic_config_defaults_applied
 run_check check_phase_45_signs_defined
 run_check check_phase_45_diagnostic_config_signs_table_has_text
@@ -7568,7 +7226,6 @@ run_check check_phase_45_signs_numhl_render_with_prescribed_highlight
 run_check check_phase_45_signs_numhl_user_override_renders
 run_check check_phase_45_signs_text_deep_merges_per_severity
 run_check check_phase_45_user_overrides_merged
-run_check check_phase_45_setup_wired_in_orchestrator
 run_check check_phase_51_treesitter_module_present
 run_check check_phase_51_treesitter_defaults_shape
 run_check check_phase_51_treesitter_setup_forwards_opts
@@ -7578,7 +7235,6 @@ run_check check_phase_51_literal_require_nvim_treesitter
 run_check check_phase_51_open_lua_file_no_error
 run_check check_phase_51_user_override_forwarded_to_configs_setup
 run_check check_phase_51_setup_does_not_mutate_builtin
-run_check check_phase_52_comment_module_calls_mini_setup
 run_check check_phase_52_comment_defaults_shape
 run_check check_phase_52_setup_forwards_options_and_pre_hook
 run_check check_phase_52_user_options_pass_through
@@ -7591,14 +7247,11 @@ run_check check_phase_52_pre_hook_uses_ref_position_not_cursor
 run_check check_phase_52_pre_hook_trusts_treesitter_over_filetype
 run_check check_phase_52_pre_hook_round_trip_resets_jsx_on_tsx_buffer
 run_check check_phase_52_pre_hook_does_not_touch_non_jsx_filetype_on_non_jsx_node
-run_check check_phase_52_sample_tsx_fixture_present
 run_check check_phase_52_acceptance_command_literal
-run_check check_phase_53_commands_lua_calls_tsupdate
 run_check check_phase_53_tsupdate_scheduled_when_treesitter_active
 run_check check_phase_53_tsupdate_skipped_when_treesitter_inactive
 run_check check_phase_53_sync_completes_when_treesitter_not_loaded
 run_check check_phase_53_tsupdate_error_does_not_abort_sync
-run_check check_phase_6_telescope_module_present
 run_check check_phase_6_telescope_defaults_shape
 run_check check_phase_6_telescope_defaults_mappings_cn_cp
 run_check check_phase_6_telescope_setup_forwards_opts
@@ -7622,7 +7275,6 @@ run_check check_phase_6_nvimtree_user_override_forwarded
 run_check check_phase_6_nvimtree_setup_does_not_mutate_builtin
 run_check check_phase_6_nvimtree_literal_acceptance_require_returns_table
 run_check check_phase_6_nvimtree_toggle_drops_nvimtree_specifically
-run_check check_phase_6_lualine_module_present
 run_check check_phase_6_lualine_defaults_shape
 run_check check_phase_6_lualine_defaults_section_components
 run_check check_phase_6_lualine_setup_forwards_opts
@@ -7632,7 +7284,6 @@ run_check check_phase_6_lualine_setup_does_not_mutate_builtin
 run_check check_phase_6_lualine_literal_acceptance_require_returns_table
 run_check check_phase_6_lualine_toggle_drops_lualine_specifically
 run_check check_phase_6_lualine_defaults_lualine_x_full_list
-run_check check_phase_6_bufferline_module_present
 run_check check_phase_6_bufferline_defaults_shape
 run_check check_phase_6_bufferline_defaults_offsets_nvimtree
 run_check check_phase_6_bufferline_setup_forwards_opts
@@ -7642,7 +7293,6 @@ run_check check_phase_6_bufferline_setup_does_not_mutate_builtin
 run_check check_phase_6_bufferline_literal_acceptance_require_returns_table
 run_check check_phase_6_bufferline_toggle_drops_bufferline_specifically
 run_check check_phase_6_bufferline_defaults_offsets_full_list
-run_check check_phase_6_gitsigns_module_present
 run_check check_phase_6_gitsigns_defaults_shape
 run_check check_phase_6_gitsigns_defaults_signs_per_status
 run_check check_phase_6_gitsigns_setup_forwards_opts
@@ -7653,7 +7303,6 @@ run_check check_phase_6_gitsigns_leader_g_group_maps_registered
 run_check check_phase_6_gitsigns_literal_acceptance_require_returns_table
 run_check check_phase_6_gitsigns_toggle_drops_gitsigns_specifically
 run_check check_phase_6_gitsigns_defaults_signs_staged_per_status
-run_check check_phase_6_whichkey_module_present
 run_check check_phase_6_whichkey_defaults_shape
 run_check check_phase_6_whichkey_defaults_leader_groups
 run_check check_phase_6_whichkey_setup_forwards_opts
@@ -7663,7 +7312,6 @@ run_check check_phase_6_whichkey_setup_does_not_mutate_builtin
 run_check check_phase_6_whichkey_literal_acceptance_require_returns_table
 run_check check_phase_6_whichkey_toggle_drops_whichkey_specifically
 run_check check_phase_6_whichkey_defaults_mappings_full_list
-run_check check_phase_6_terminal_module_present
 run_check check_phase_6_terminal_defaults_shape
 run_check check_phase_6_terminal_setup_forwards_opts
 run_check check_phase_6_terminal_setup_pcall_guards_missing
@@ -7690,7 +7338,6 @@ run_check check_phase_6_breadcrumbs_spec_uses_breadcrumbs_active_gate
 run_check check_phase_6_breadcrumbs_literal_acceptance_require_returns_table
 run_check check_phase_6_breadcrumbs_toggle_drops_breadcrumbs_specifically
 run_check check_phase_6_breadcrumbs_defaults_icons_full_list
-run_check check_phase_6_indentlines_module_present
 run_check check_phase_6_indentlines_defaults_shape
 run_check check_phase_6_indentlines_setup_forwards_opts
 run_check check_phase_6_indentlines_setup_pcall_guards_missing
