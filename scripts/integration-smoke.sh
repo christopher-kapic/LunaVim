@@ -23,6 +23,13 @@ if ! command -v tree-sitter >/dev/null 2>&1; then
   exit 1
 fi
 
+# The resync probes below extract a pin from snapshots/default.json with
+# python3 (same dependency snapshot-export.sh already assumes).
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "[integration-smoke] missing required dependency: python3" >&2
+  exit 1
+fi
+
 TMP="$(mktemp -d -t lvim-integration-XXXXXX)"
 # Cleanup must never change the script's exit status.
 #
@@ -499,6 +506,53 @@ if ! grep -q 'shellcheck' <<<"$lint_out"; then
   printf '[integration-smoke] nvim-lint loaded but linters_by_ft.sh is wrong:\n%s\n' "$lint_out" >&2
   exit 1
 fi
+
+# :LvimSyncCorePlugins must INSTALL entries missing from disk, not just
+# re-pin the installed set. lazy.restore()'s runner filters to
+# already-installed plugins (`plugin.url and plugin._.installed` in
+# lazy/manage/init.lua), so until the command chained
+# lazy.install({ lockfile = true }) ahead of restore, a runtime missing a
+# core plugin stayed missing forever: the command wrote the lockfile and
+# checked out pins for whatever was already on disk, and the startup
+# advisory kept telling the user to run the very command that could not
+# fix the state it was reporting. A stubbed-lazy smoke check pins the
+# dispatch; this probe pins the real behavior end-to-end.
+#
+# Probe both confirm branches, each from a FRESH session so lazy computes
+# `_.installed` from disk and sees the deletion:
+#   1. accept (`!` bang): the snapshot lockfile is written, and the missing
+#      plugin must come back AT the snapshot's pinned commit.
+#   2. decline (unbanged; a headless confirm answers the default "No"): the
+#      user's lockfile is kept as-is, and the missing plugin must still come
+#      back — at its pin in that lockfile.
+echo "[integration-smoke] resync: missing core plugin is reinstalled at its pin"
+ILLUMINATE_DIR="$RUNTIME_DIR/lazy/illuminate"
+RESYNC_PIN="$(python3 - "$REPO_ROOT/snapshots/default.json" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1]))["illuminate"]["commit"])
+PY
+)"
+resync_probe() {
+  local label="$1" cmd="$2" log="$3" normalized rc
+  rm -rf "$ILLUMINATE_DIR"
+  set +e
+  LVIM_RESYNC_DIR="$ILLUMINATE_DIR" LVIM_RESYNC_PIN="$RESYNC_PIN" \
+    nvim --headless \
+      --cmd "let g:lunavim_isolated_xdg = v:true" \
+      -u "$REPO_ROOT/init.lua" \
+      -c "$cmd" \
+      -c 'lua local d = vim.env.LVIM_RESYNC_DIR; local pin = vim.env.LVIM_RESYNC_PIN; local ok = vim.wait(120000, function() if vim.fn.isdirectory(d) ~= 1 then return false end; local out = vim.fn.system({ "git", "-C", d, "rev-parse", "HEAD" }); return vim.v.shell_error == 0 and vim.trim(out) == pin end, 250); if ok then print("RESYNC_OK") else print("RESYNC_FAIL") end' \
+      -c 'qall!' > "$log" 2>&1
+  rc=$?
+  set -e
+  normalized="$(tr -d '\r' < "$log")"
+  if (( rc != 0 )) || ! grep -q '^RESYNC_OK$' <<<"$normalized"; then
+    printf '[integration-smoke] %s probe failed (rc=%d):\n%s\n' "$label" "$rc" "$normalized" >&2
+    exit 1
+  fi
+}
+resync_probe "accept" 'LvimSyncCorePlugins!' "$TMP/resync-accept-log"
+resync_probe "decline" 'LvimSyncCorePlugins' "$TMP/resync-decline-log"
 
 if ! grep -q "^INTEGRATION_OK$" <<<"$log_normalized"; then
   echo "[integration-smoke] driver did not reach INTEGRATION_OK" >&2

@@ -1137,17 +1137,23 @@ check_phase_23_lvim_sync_core_plugins_dispatches() {
   # what made an earlier version of this check report a false failure).
   local cfg_dir output stub
 
-  stub='lua _G.__sync = false; _G.__restore = false; package.loaded.lazy = { sync = function() _G.__sync = true end, restore = function() _G.__restore = true end, stats = function() return { count = 0 } end }'
+  stub='lua _G.__sync = false; _G.__restore = false; _G.__install = false; package.loaded.lazy = { sync = function() _G.__sync = true end, restore = function() _G.__restore = true end, install = function() _G.__install = true; return { wait = function(_, cb) if cb then cb() end end } end, stats = function() return { count = 0 } end }'
 
-  # Branch 1: the repository's real, non-empty snapshot -> restore.
+  # Branch 1: the repository's real, non-empty snapshot -> install + restore.
+  # INSTALL must flip true as well: lazy.restore() only processes plugins
+  # already on disk (its runner filters on `_.installed`), so the command
+  # has to drive lazy.install({ lockfile = true }) for spec entries missing
+  # from the runtime dir to ever be cloned. Without that call, a fresh
+  # machine running :LvimSyncCorePlugins! re-pinned the installed set and
+  # silently left the missing plugins absent.
   cfg_dir="$(make_empty_config_dir)"
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "$stub" \
     -c 'LvimSyncCorePlugins!' \
-    -c 'lua print("SYNC=" .. tostring(_G.__sync) .. " RESTORE=" .. tostring(_G.__restore))' \
+    -c 'lua print("SYNC=" .. tostring(_G.__sync) .. " RESTORE=" .. tostring(_G.__restore) .. " INSTALL=" .. tostring(_G.__install))' \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^SYNC=false RESTORE=true$' <<<"${output//$'\r'/}"; then
-    printf 'phase 2.3 LvimSyncCorePlugins did not restore from a non-empty snapshot (output: %s)\n' "$output" >&2
+  if ! grep -q '^SYNC=false RESTORE=true INSTALL=true$' <<<"${output//$'\r'/}"; then
+    printf 'phase 2.3 LvimSyncCorePlugins did not install+restore from a non-empty snapshot (output: %s)\n' "$output" >&2
     return 1
   fi
   # The lockfile must have been written with the snapshot's contents.
@@ -1168,9 +1174,9 @@ check_phase_23_lvim_sync_core_plugins_dispatches() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" LUNAVIM_BASE_DIR="$fake_base" nvim --headless -u init.lua \
     -c "$stub" \
     -c 'LvimSyncCorePlugins!' \
-    -c 'lua print("SYNC=" .. tostring(_G.__sync) .. " RESTORE=" .. tostring(_G.__restore))' \
+    -c 'lua print("SYNC=" .. tostring(_G.__sync) .. " RESTORE=" .. tostring(_G.__restore) .. " INSTALL=" .. tostring(_G.__install))' \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^SYNC=true RESTORE=false$' <<<"${output//$'\r'/}"; then
+  if ! grep -q '^SYNC=true RESTORE=false INSTALL=false$' <<<"${output//$'\r'/}"; then
     printf 'phase 2.3 LvimSyncCorePlugins did not fall back to lazy.sync on an empty snapshot (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -1357,7 +1363,7 @@ check_phase_24_non_empty_snapshot_restores() {
   set +e
   output="$(LUNAVIM_BASE_DIR="$fake_base" LUNAVIM_CONFIG_DIR="$cfg_dir" \
     nvim --headless -u init.lua \
-    -c 'lua _G.__lvim_restore_called = false; package.loaded.lazy = { sync = function() _G.__lvim_sync_called = true end, restore = function() _G.__lvim_restore_called = true end, stats = function() return { count = 0 } end }' \
+    -c 'lua _G.__lvim_restore_called = false; package.loaded.lazy = { sync = function() _G.__lvim_sync_called = true end, restore = function() _G.__lvim_restore_called = true end, install = function() return { wait = function(_, cb) if cb then cb() end end } end, stats = function() return { count = 0 } end }' \
     -c 'LvimSyncCorePlugins!' \
     -c 'lua print("RESTORE=" .. tostring(_G.__lvim_restore_called) .. " LOCK_EXISTS=" .. tostring(vim.uv.fs_stat(vim.env.LUNAVIM_CONFIG_DIR .. "/lazy-lock.json") ~= nil))' \
     -c 'qall!' 2>&1)"
@@ -4306,7 +4312,7 @@ check_phase_53_tsupdate_scheduled_when_treesitter_active() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua _G.__ts_called = false; vim.api.nvim_create_user_command("TSUpdate", function() _G.__ts_called = true end, {})' \
     -c 'lua package.loaded["nvim-treesitter"] = { __stub = true }' \
-    -c 'lua package.loaded.lazy = { sync = function() end, restore = function() end, stats = function() return { count = 0 } end }' \
+    -c 'lua package.loaded.lazy = { sync = function() end, restore = function() end, install = function() return { wait = function(_, cb) if cb then cb() end end } end, stats = function() return { count = 0 } end }' \
     -c 'LvimSyncCorePlugins!' \
     -c 'lua vim.wait(500, function() return _G.__ts_called end)' \
     -c 'lua print("TS_CALLED=" .. tostring(_G.__ts_called))' \
@@ -4329,7 +4335,7 @@ check_phase_53_tsupdate_skipped_when_treesitter_inactive() {
 
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" LUNAVIM_BASE_DIR="$snap_base" nvim --headless -u init.lua \
     -c 'lua _G.__ts_called = false; vim.api.nvim_create_user_command("TSUpdate", function() _G.__ts_called = true end, {})' \
-    -c 'lua package.loaded.lazy = { sync = function() end, restore = function() end, stats = function() return { count = 0 } end }' \
+    -c 'lua package.loaded.lazy = { sync = function() end, restore = function() end, install = function() return { wait = function(_, cb) if cb then cb() end end } end, stats = function() return { count = 0 } end }' \
     -c 'LvimSyncCorePlugins!' \
     -c 'lua vim.wait(200)' \
     -c 'lua print("TS_CALLED=" .. tostring(_G.__ts_called))' \

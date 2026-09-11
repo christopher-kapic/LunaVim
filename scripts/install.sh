@@ -15,6 +15,9 @@ LUNAVIM_BIN_DIR="${LUNAVIM_BIN_DIR:-${LVIM_BIN_DIR:-"$HOME/.local/bin"}}"
 LUNAVIM_CONFIG_DIR="${LUNAVIM_CONFIG_DIR:-${LUNARVIM_CONFIG_DIR:-${LVIM_CONFIG_DIR:-"$HOME/.config/lvim"}}}"
 LUNAVIM_RUNTIME_DIR="${LUNAVIM_RUNTIME_DIR:-${LUNARVIM_RUNTIME_DIR:-"$HOME/.local/share/lunavim"}}"
 LUNAVIM_CACHE_DIR="${LUNAVIM_CACHE_DIR:-${LUNARVIM_CACHE_DIR:-"$HOME/.cache/lvim"}}"
+# Release of the tree-sitter CLI the installer fetches when none is on PATH
+# (mirrors .github/workflows/ci.yml). Set to "skip" to leave the CLI alone.
+LUNAVIM_TREE_SITTER_VERSION="${LUNAVIM_TREE_SITTER_VERSION:-v0.27.0}"
 
 LVIM_INSTALL_DIR="$LUNAVIM_INSTALL_DIR"
 LVIM_REPO_URL="$LUNAVIM_REPO_URL"
@@ -41,6 +44,9 @@ Environment:
   LUNAVIM_REPO_URL     Git repository URL to clone
   LUNAVIM_BIN_DIR      Launcher destination directory (default: ~/.local/bin)
   LUNAVIM_CONFIG_DIR   User config directory (default: ~/.config/lvim)
+  LUNAVIM_TREE_SITTER_VERSION
+                       tree-sitter CLI release fetched when none is on PATH
+                       (default: v0.27.0; "skip" disables the fetch)
 
 Compatibility:
   LUNAVIM_BASE_DIR and LUNARVIM_BASE_DIR are accepted as install directory aliases.
@@ -253,6 +259,109 @@ install_launcher() {
   esac
 }
 
+# nvim-treesitter needs the `tree-sitter` CLI to fetch and build parsers.
+# The CLI has no stable home in distro package managers and the npm
+# `tree-sitter-cli` package is deprecated, so mirror CI's approach: fetch
+# the pinned release binary from GitHub into the launcher's bin dir (which
+# install_launcher has already created and PATH-checked). Best-effort —
+# LunaVim degrades gracefully without it (parser installs skip with a
+# WARN; see lua/lvim/plugins/modules/treesitter.lua) — so every failure
+# path here warns and continues rather than failing the install.
+ensure_tree_sitter_cli() {
+  # Note: first-install-only by design — an existing CLI is never upgraded
+  # or replaced, including one a previous run of this installer fetched:
+  # stomping a package-manager (or otherwise user-managed) install from
+  # under the user is worse than running a release behind the pin.
+  if command -v tree-sitter >/dev/null 2>&1; then
+    log "tree-sitter CLI already on PATH ($(command -v tree-sitter))"
+    return 0
+  fi
+
+  # A binary this installer previously fetched still counts as present
+  # even when the bin dir is not on PATH — without this check, every
+  # re-run on such a machine would re-download a content-identical file.
+  if [[ -x "$LUNAVIM_BIN_DIR/tree-sitter" ]]; then
+    log "tree-sitter CLI already installed at $LUNAVIM_BIN_DIR/tree-sitter (not on PATH)"
+    export PATH="$LUNAVIM_BIN_DIR:$PATH"
+    return 0
+  fi
+
+  if [[ "$LUNAVIM_TREE_SITTER_VERSION" == "skip" ]]; then
+    log "Skipping tree-sitter CLI install (LUNAVIM_TREE_SITTER_VERSION=skip)"
+    return 0
+  fi
+
+  local os arch url dest temp
+  case "$(uname -s)" in
+    Linux) os="linux" ;;
+    Darwin) os="macos" ;;
+    *)
+      warn "unsupported OS $(uname -s) for the tree-sitter CLI download; parser installs will be skipped (see :checkhealth lvim)"
+      return 0
+      ;;
+  esac
+  case "$(uname -m)" in
+    x86_64 | amd64) arch="x64" ;;
+    aarch64 | arm64) arch="arm64" ;;
+    *)
+      warn "unsupported CPU $(uname -m) for the tree-sitter CLI download; parser installs will be skipped (see :checkhealth lvim)"
+      return 0
+      ;;
+  esac
+
+  if ! command -v curl >/dev/null 2>&1; then
+    warn "curl not found; skipping tree-sitter CLI install (parser installs will be skipped)"
+    return 0
+  fi
+
+  url="https://github.com/tree-sitter/tree-sitter/releases/download/${LUNAVIM_TREE_SITTER_VERSION}/tree-sitter-${os}-${arch}.gz"
+  dest="$LUNAVIM_BIN_DIR/tree-sitter"
+
+  log "Installing tree-sitter CLI ${LUNAVIM_TREE_SITTER_VERSION} to $dest"
+  if (( DRY_RUN )); then
+    log "dry-run: curl -fsSL $url | gunzip > $dest"
+    return 0
+  fi
+
+  # Stage INSIDE the destination dir so the final mv stays on one
+  # filesystem (mktemp's default $TMPDIR is commonly another fs — notably
+  # macOS /var/folders — where mv degrades to copy+unlink and loses
+  # atomicity). Every step is individually guarded: this function's
+  # contract is warn-and-continue, and an unguarded failure under `set -e`
+  # would abort the whole install mid-way — after the launcher was
+  # already replaced — which is exactly what must not happen here.
+  if ! temp="$(mktemp "$LUNAVIM_BIN_DIR/.tree-sitter.XXXXXX")"; then
+    warn "could not create a temp file in $LUNAVIM_BIN_DIR; skipping tree-sitter CLI install"
+    return 0
+  fi
+  if ! curl -fsSL "$url" | gunzip >"$temp"; then
+    rm -f "$temp"
+    warn "failed to download $url; install the tree-sitter CLI manually (parser installs will be skipped)"
+    return 0
+  fi
+  if ! chmod +x "$temp" || ! mv "$temp" "$dest"; then
+    rm -f "$temp"
+    warn "could not install the tree-sitter CLI to $dest; install it manually (parser installs will be skipped)"
+    return 0
+  fi
+
+  if "$dest" --version >/dev/null 2>&1; then
+    log "tree-sitter CLI installed: $("$dest" --version 2>/dev/null | head -1)"
+    # Export so the priming run below sees the CLI even when the launcher's
+    # bin dir is not on the user's PATH yet (the audience install_launcher
+    # just warned about): without this, nvim-treesitter's build steps during
+    # prime_core_plugins run the degraded no-CLI path.
+    export PATH="$LUNAVIM_BIN_DIR:$PATH"
+  else
+    # A binary that fails its own --version check (truncated download,
+    # incompatible libc) must not stay at $dest: the `-x` short-circuit
+    # above would greet every later run's broken leftover as "already
+    # installed" and never repair it.
+    rm -f "$dest"
+    warn "$dest did not run; removed it. Install the tree-sitter CLI manually"
+  fi
+}
+
 # shellcheck disable=SC2016
 # The two `grep -Fq '...$LVIM_...'` calls below match LITERAL text in the
 # launcher file, so the `$` must not expand. A directive cannot sit mid-`&&`
@@ -380,6 +489,7 @@ main() {
   detect_prior_install
   ensure_checkout
   install_launcher
+  ensure_tree_sitter_cli
   write_starter_config
   prime_core_plugins
 

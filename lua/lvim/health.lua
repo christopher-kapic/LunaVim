@@ -116,7 +116,8 @@ function M.check()
   check_compiler()
   check_executable("tree-sitter", {
     "nvim-treesitter parser install/update needs the `tree-sitter` CLI",
-    "Install it from your system package manager; do not use the deprecated npm package",
+    "Re-run LunaVim's install script (scripts/install.sh); it fetches a pinned tree-sitter CLI into the launcher's bin dir (default ~/.local/bin) when none is on PATH",
+    "Or install it from your system package manager; do not use the deprecated npm package",
   })
   check_executable("rg", {
     "Telescope live_grep uses ripgrep",

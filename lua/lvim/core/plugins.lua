@@ -68,6 +68,57 @@ end
 -- inside `lazy.manage.install`), making the smoke test wedge on a 15-plugin
 -- network round-trip on every invocation. User config can still flip it
 -- back via `lvim.lazy.opts = { install = { missing = true } }`.
+-- Advisory for the state `install.missing = false` makes reachable: spec
+-- entries with no on-disk install. This is what a user lands in after
+-- updating the checkout without re-syncing plugins (e.g. a bare `git pull`
+-- in the install dir, or `:LvimUpdate` before it chained a sync): lazy.nvim
+-- only reports the gap per lazy-load trigger, one cryptic
+-- "Plugin <name> is not installed" error at a time, with no hint at the
+-- remedy. One scheduled WARN naming the full missing set replaces that
+-- confusion with the fix.
+--
+-- Gated on an attached UI: the smoke harness boots headless with
+-- `install.missing = false` and deliberately runs without core plugins on
+-- disk, and this advisory must not leak into its stderr assertions (lazy's
+-- own per-plugin errors are what it tolerates there). The wording avoids
+-- the phrase "is not installed" for the same reason — both smoke scripts
+-- pattern-match that exact shape as lazy.nvim noise. The gate also
+-- suppresses the advisory for `--embed` front ends (neovide,
+-- VSCode-neovim) that attach their UI after init — acceptable: they are
+-- outside LunaVim's terminal-launcher contract.
+local function warn_missing_plugins()
+  if #vim.api.nvim_list_uis() == 0 then
+    return
+  end
+  local ok, config = pcall(require, "lazy.core.config")
+  if not ok or type(config.plugins) ~= "table" then
+    return
+  end
+
+  local missing = {}
+  for _, plugin in pairs(config.plugins) do
+    if plugin._.installed ~= true then
+      missing[#missing + 1] = plugin.name
+    end
+  end
+  if #missing == 0 then
+    return
+  end
+
+  table.sort(missing)
+  vim.schedule(function()
+    vim.notify(
+      string.format(
+        "lvim: %d plugin%s missing from the runtime dir (%s). Run :LvimSyncCorePlugins to install them.",
+        #missing,
+        #missing == 1 and "" or "s",
+        table.concat(missing, ", ")
+      ),
+      vim.log.levels.WARN
+    )
+  end)
+end
+
 function M.load()
   local lvim = _G.lvim or {}
   local user_opts = (lvim.lazy and lvim.lazy.opts) or {}
@@ -113,7 +164,9 @@ function M.load()
   opts.performance.rtp.paths = new_paths
 
   local spec = require("lvim.plugins").final_spec()
-  return require("lazy").setup(spec, opts)
+  local lazy = require("lazy").setup(spec, opts)
+  warn_missing_plugins()
+  return lazy
 end
 
 return M

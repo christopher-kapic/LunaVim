@@ -71,10 +71,39 @@ local function lvim_info()
   vim.api.nvim_buf_set_lines(0, 0, -1, false, build_info_lines())
 end
 
+-- Snapshot-driven plugin sync, shared by :LvimSyncCorePlugins and the
+-- post-pull pass of :LvimUpdate above. Forward-declared here so
+-- lvim_update's on_exit callback can reference it; the definition below
+-- assigns to this local (a `local function` there would shadow the
+-- placeholder instead, leaving lvim_update calling nil).
+local sync_core_plugins
+
 -- :LvimUpdate runs `git pull --rebase --autostash` inside the LunaVim base
 -- directory and streams every captured line through vim.notify. Using
 -- vim.fn.jobstart keeps the UI responsive (the LunarVim original ran git
 -- synchronously and froze the editor for the duration of the pull).
+--
+-- When the pull actually moved HEAD, it chains a core-plugin sync. Without
+-- that, a spec change shipped in the pull leaves the runtime dir without
+-- the new plugins, and since `install.missing = false` keeps lazy.nvim
+-- from installing anything at launch, every lazy-load trigger for a new
+-- entry errors with "Plugin <name> is not installed" until the user
+-- manually runs :LvimSyncCorePlugins. Upstream LunarVim's update flow
+-- chains its plugin sync for the same reason.
+--
+-- The chained sync only runs when the pull moved HEAD, detected by
+-- comparing `git rev-parse HEAD` before and after (git localizes its
+-- "up to date" prose — "Bereits aktuell.", "Déjà à jour." — so its
+-- output cannot be matched reliably): a no-op update should not pay a
+-- network round-trip per managed plugin.
+local function git_head(base)
+  local out = vim.fn.system({ "git", "-C", base, "rev-parse", "HEAD" })
+  if vim.v.shell_error ~= 0 then
+    return nil
+  end
+  return vim.trim(out)
+end
+
 local function lvim_update()
   local base = call_or(_G.get_lvim_base_dir, "")
   if base == "" then
@@ -83,6 +112,7 @@ local function lvim_update()
   end
 
   vim.notify(string.format("LvimUpdate: git pull --rebase --autostash in %s", base), vim.log.levels.INFO)
+  local head_before = git_head(base)
 
   local function stream(level)
     return function(_, data)
@@ -101,11 +131,26 @@ local function lvim_update()
     on_stdout = stream(vim.log.levels.INFO),
     on_stderr = stream(vim.log.levels.WARN),
     on_exit = function(_, code)
-      if code == 0 then
-        vim.notify("LvimUpdate OK", vim.log.levels.INFO)
-      else
+      if code ~= 0 then
         vim.notify(string.format("LvimUpdate failed (exit %d)", code), vim.log.levels.ERROR)
+        return
       end
+      vim.notify("LvimUpdate OK", vim.log.levels.INFO)
+
+      -- Commit SHAs are stable across locales, and no path through
+      -- `pull --rebase --autostash` updates the working tree without
+      -- moving HEAD (a rebase replay produces new SHAs too). When either
+      -- rev-parse fails, assume the checkout changed: the safe failure
+      -- direction is a spurious sync (a wasted round trip), not skipping
+      -- a needed one (which strands new spec entries uninstalled).
+      local head_after = git_head(base)
+      if head_before and head_after and head_before == head_after then
+        vim.notify("LvimUpdate: checkout unchanged; skipping plugin sync", vim.log.levels.INFO)
+        return
+      end
+
+      vim.notify("LvimUpdate: syncing core plugins after update", vim.log.levels.INFO)
+      sync_core_plugins(false)
     end,
   })
 end
@@ -119,7 +164,11 @@ end
 --
 -- The `bang` form (`:LvimSyncCorePlugins!`) skips the overwrite
 -- confirmation; the unbanged form prompts because writing the lockfile
--- is destructive of the user's currently-pinned commit set.
+-- is destructive of the user's currently-pinned commit set. Declining
+-- keeps the user's pins but still installs missing entries at them,
+-- restores drifted checkouts, and cleans removed plugins — see the
+-- confirm block in `sync_core_plugins` below for why "No" must not be a
+-- no-op.
 local function snapshot_path()
   local base = call_or(_G.get_lvim_base_dir, "")
   if base == "" then
@@ -218,7 +267,7 @@ local function maybe_schedule_tsupdate()
   end
 end
 
-local function lvim_sync_core_plugins(opts)
+sync_core_plugins = function(bang)
   local ok, lazy = pcall(require, "lazy")
   if not ok then
     vim.notify("LvimSyncCorePlugins: lazy.nvim not available", vim.log.levels.ERROR)
@@ -249,12 +298,32 @@ local function lvim_sync_core_plugins(opts)
 
   local snap_path = snapshot_path()
   local lockfile = config_dir .. "/lazy-lock.json"
-  local bang = opts and opts.bang
 
   if not bang then
     local choice = vim.fn.confirm(string.format("Overwrite %s with snapshot %s?", lockfile, snap_path), "&Yes\n&No", 2)
     if choice ~= 1 then
-      vim.notify("LvimSyncCorePlugins cancelled", vim.log.levels.INFO)
+      -- "No" means "keep my pins", not "do nothing". lazy.restore() alone
+      -- cannot honor even that: its runner filters to ALREADY-INSTALLED
+      -- plugins (lazy/manage/init.lua: `plugin.url and plugin._.installed`),
+      -- so it re-checks-out pins but never puts spec entries missing from
+      -- disk there. Chain lazy.install({ lockfile = true }) — the same
+      -- call lazy.nvim's own startup path makes when install.missing is on
+      -- — which clones missing entries AT their lockfile pins, then restore
+      -- (re-pin drifted checkouts) and clean (drop spec-removed dirs).
+      -- lazy.sync() would be wrong here: its update stage moves every
+      -- installed plugin to branch HEAD and rewrites the lockfile,
+      -- discarding exactly the pins the user just declined to give up.
+      -- This branch also covers headless runs, where confirm() cannot
+      -- prompt and answers with the default choice.
+      vim.notify(
+        "LvimSyncCorePlugins: keeping your lazy-lock.json pins; installing missing plugins and cleaning removed ones",
+        vim.log.levels.INFO
+      )
+      lazy.install({ lockfile = true }):wait(function()
+        lazy.restore()
+        lazy.clean()
+      end)
+      maybe_schedule_tsupdate()
       return
     end
   end
@@ -269,8 +338,24 @@ local function lvim_sync_core_plugins(opts)
     return
   end
 
-  lazy.restore()
+  -- Install BEFORE restore: restore's runner only processes plugins that
+  -- are already on disk (it re-checks-out their pins against the lockfile
+  -- we just wrote), so a fresh runtime — or a spec entry shipped after the
+  -- user's last sync — only lands on disk via install, which clones it AT
+  -- the lockfile commit. Without this, :LvimSyncCorePlugins! on a machine
+  -- missing core plugins re-pinned the installed set and silently left the
+  -- missing ones absent (lazy.restore() alone never installs).
+  lazy.install({ lockfile = true }):wait(function()
+    lazy.restore()
+  end)
   maybe_schedule_tsupdate()
+end
+
+-- :LvimSyncCorePlugins entry point: a thin adapter from the user-command
+-- opts table onto the shared sync above. :LvimUpdate's post-pull pass
+-- calls sync_core_plugins directly.
+local function lvim_sync_core_plugins(opts)
+  sync_core_plugins(opts and opts.bang or false)
 end
 
 -- Phase 3.4: a one-shot re-apply of the user-visible runtime state. The

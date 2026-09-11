@@ -28,7 +28,10 @@ surfaces are still `lvim` — old muscle memory carries over.
 - **Neovim 0.11 or newer** (`nvim --version`).
 - **git** on `PATH`.
 - A C compiler (`cc` / `gcc` / `clang`) and the `tree-sitter` CLI —
-  `nvim-treesitter` needs both to build and update parsers.
+  `nvim-treesitter` needs both to build and update parsers. The install
+  script fetches a pinned `tree-sitter` CLI into `~/.local/bin` when none
+  is on `PATH` (set `LUNAVIM_TREE_SITTER_VERSION=skip` to opt out); the
+  C compiler must come from your system.
 - **Optional but recommended:**
   - [`ripgrep`](https://github.com/BurntSushi/ripgrep) (`rg`) — used by
     telescope's live grep.
@@ -65,18 +68,23 @@ Re-run with `--force` to overwrite anyway.
 Two options, both safe to re-run:
 
 - **In Neovim:** `:LvimUpdate` runs `git pull --rebase --autostash` in
-  the LunaVim base dir to pull the latest source. Follow it with
-  `:LvimSyncCorePlugins` to apply the refreshed plugin snapshot.
+  the LunaVim base dir to pull the latest source. When the pull moves
+  HEAD it then chains a plugin sync itself, so newly-shipped core plugins
+  land without a manual follow-up (run `:LvimSyncCorePlugins` yourself
+  only if you cancelled that step).
 - **From the shell:** re-run the installer. It's idempotent —
   it fast-forwards the existing checkout, rewrites the `lvim` launcher,
-  and exits.
+  re-syncs the core plugins, and fetches the pinned `tree-sitter` CLI
+  when none is on PATH.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/christopher-kapic/LunaVim/master/scripts/install.sh | bash
 ```
 
-After updating LunaVim itself, run `:LvimSyncCorePlugins` inside Neovim
-to apply the pinned plugin snapshot.
+The in-Neovim sync applies the pinned plugin snapshot from
+`snapshots/default.json` (answer "No" to the lockfile-overwrite prompt to
+keep your own pins — missing plugins are still installed at their pins).
+The installer instead syncs plugins at their tracked branches.
 
 ## Uninstall
 
