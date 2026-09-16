@@ -3,7 +3,7 @@ local resolved_dirs = nil
 
 local MIN_NVIM_VERSION = {
   major = 0,
-  minor = 11,
+  minor = 12,
   patch = 0,
 }
 

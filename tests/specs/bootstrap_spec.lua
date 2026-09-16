@@ -93,7 +93,7 @@ describe("bootstrap", function()
 
     assert.is_false(bootstrap.check_min_nvim_version())
     assert.equals(vim.log.levels.ERROR, notified.level)
-    assert.matches("LunaVim requires Neovim >= 0%.11%.0", notified.message)
+    assert.matches("LunaVim requires Neovim >= 0%.12%.0", notified.message)
     assert.matches("current version is 0%.10%.4", notified.message)
   end)
 

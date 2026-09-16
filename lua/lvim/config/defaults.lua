@@ -459,15 +459,10 @@ return {
         },
       },
     },
-    -- Treesitter parsers + highlighting. We pin nvim-treesitter to its
-    -- `master` branch in the plugin spec because its `main` branch is an
-    -- incompatible rewrite requiring Neovim 0.12 (LunaVim's minimum is
-    -- 0.11). On `master` the canonical configuration shape is the
-    -- `nvim-treesitter.configs.setup(opts)` table used by LunarVim's
-    -- upstream reference (under `references/`) and documented in
-    -- `:help nvim-treesitter-quickstart`. The module under
-    -- `lvim/plugins/modules/treesitter.lua` forwards this whole subtree
-    -- (minus `active`) to that setup call.
+    -- Treesitter parsers + highlighting. LunaVim pins nvim-treesitter's
+    -- `main` branch (Neovim 0.12+ rewrite). The module under
+    -- `lvim/plugins/modules/treesitter.lua` consumes this subtree (minus
+    -- `active`) to install parsers and wire per-buffer highlight/indent.
     treesitter = {
       active = true,
       -- `comment` powers mini.comment's treesitter-aware commentstring
@@ -503,6 +498,26 @@ return {
     -- by the module and is not exposed for user override here; Phase 6 may
     -- extend the surface if needed.
     comment = { active = true, options = {} },
+    -- Auto-pairs for quotes, brackets, and parentheses via blink.pairs. The
+    -- whole subtree (minus `active`) is forwarded to
+    -- `require("blink.pairs").setup(opts)` by
+    -- `lvim/plugins/modules/autopairs.lua`.
+    --
+    -- Completion-time brackets (`foo` → `foo()`) are owned by blink.cmp's
+    -- `completion.accept.auto_brackets` under `lvim.builtin.cmp`, not here.
+    -- Disable with `lvim.builtin.autopairs.active = false` (LunarVim parity).
+    autopairs = {
+      active = true,
+      mappings = {
+        enabled = true,
+        cmdline = true,
+        disabled_filetypes = { "TelescopePrompt" },
+      },
+      highlights = {
+        enabled = true,
+        cmdline = true,
+      },
+    },
     -- Project-root detection, implemented natively in `lvim/core/project.lua`
     -- rather than by a plugin -- see that file for why.
     --
@@ -609,6 +624,10 @@ return {
     -- arguments; blink marks the feature experimental but it is the direct
     -- replacement for the `gs` binding's manual invocation and is stable in
     -- practice for the servers LunaVim installs by default.
+    --
+    -- `completion.accept.auto_brackets` adds `()` when accepting function or
+    -- method completions. General delimiter pairing while typing is handled by
+    -- blink.pairs (`lvim.builtin.autopairs`), not here.
     cmp = {
       active = true,
       keymap = { preset = "default" },
@@ -617,6 +636,7 @@ return {
       },
       completion = {
         documentation = { auto_show = true, auto_show_delay_ms = 200 },
+        accept = { auto_brackets = { enabled = true } },
         ghost_text = { enabled = false },
       },
       signature = { enabled = true },

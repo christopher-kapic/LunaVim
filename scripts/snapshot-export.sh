@@ -61,7 +61,7 @@ fi
 # otherwise the repo basename.
 #
 # nvim-treesitter is excluded on purpose. `spec.lua` selects its branch by
-# Neovim version (`master` on 0.11, `main` on 0.12+), so a single pinned commit
+# Neovim version (LunaVim pins `main` exclusively on 0.12+), so a single pinned
 # is wrong for one of the two supported versions — pinning a `main` commit and
 # then restoring it onto a `master` checkout is exactly the failure this
 # exclusion prevents. Parser and plugin updates flow through `:TSUpdate` and the

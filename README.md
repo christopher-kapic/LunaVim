@@ -25,7 +25,7 @@ surfaces are still `lvim` — old muscle memory carries over.
 
 ## Requirements
 
-- **Neovim 0.11 or newer** (`nvim --version`).
+- **Neovim 0.12 or newer** (`nvim --version`).
 - **git** on `PATH`.
 - A C compiler (`cc` / `gcc` / `clang`) and the `tree-sitter` CLI —
   `nvim-treesitter` needs both to build and update parsers. The install

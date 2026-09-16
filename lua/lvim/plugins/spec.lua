@@ -259,30 +259,21 @@ return {
     config = setup("terminal"),
   },
 
-  -- Treesitter parsers + highlighting. Pinned to `branch = "master"`: the
-  -- `main` branch is an incompatible rewrite requiring Neovim 0.12 (nightly),
-  -- but LunaVim's minimum is 0.11 (see `lua/lvim/bootstrap.lua`). The master
-  -- branch remains maintained as the 0.11-compatible line and still supports
-  -- the BufReadPost/BufNewFile lazy-load hook used here.
-  -- Branch is picked by Neovim version: `master` is the legacy
-  -- 0.11-compatible line, `main` is the Neovim-0.12+ rewrite with a
-  -- different setup API. On 0.12 the `master` branch's parser-runtime
-  -- glue mismatches Neovim core's treesitter — opening a `.md` file
-  -- raises `attempt to call method 'range' (a nil value)` from
-  -- `vim/treesitter.lua:get_range` because the parse callback returns
-  -- a nil node `main` no longer produces. `main` ships with a totally
-  -- different config surface; the module under
-  -- `lvim/plugins/modules/treesitter.lua` feature-probes both and
-  -- dispatches accordingly. `build` is gated on the `tree-sitter` CLI.
-  -- Both the legacy and current nvim-treesitter install paths shell out to
-  -- the CLI during parser builds, so skip quietly when it is absent and let
-  -- `:checkhealth lvim` surface the prerequisite instead of spraying
+  -- Treesitter parsers + highlighting. LunaVim's minimum is Neovim 0.12
+  -- (see `lua/lvim/bootstrap.lua`), so we pin the `main` branch rewrite
+  -- exclusively. The legacy `master` line mismatches Neovim core's
+  -- treesitter runtime on 0.12+ and is not supported here. The module under
+  -- `lvim/plugins/modules/treesitter.lua` targets the `main` API
+  -- (`require('nvim-treesitter').install`, per-buffer `vim.treesitter.start`).
+  -- `build` is gated on the `tree-sitter` CLI: both install paths shell out
+  -- to the CLI during parser builds, so skip quietly when it is absent and
+  -- let `:checkhealth lvim` surface the prerequisite instead of spraying
   -- install-time stderr.
   {
     "nvim-treesitter/nvim-treesitter",
     name = "treesitter",
     enabled = gate("treesitter"),
-    branch = vim.fn.has("nvim-0.12") == 1 and "main" or "master",
+    branch = "main",
     build = function()
       if vim.fn.executable("tree-sitter") == 1 then
         pcall(vim.cmd, "TSUpdate")
@@ -432,6 +423,30 @@ return {
     event = { "InsertEnter", "CmdlineEnter" },
     opts = {},
     config = setup("cmp"),
+  },
+
+  -- Auto-pairs for quotes, brackets, and parentheses.
+  --
+  -- blink.pairs ships in the blink.nvim ecosystem (same author as blink.cmp).
+  -- `version = "*"` tracks tagged releases with prebuilt parser binaries,
+  -- mirroring the blink.cmp pin rationale: without a tag, lazy.nvim checks out
+  -- the default branch and the Rust parser must be built locally.
+  --
+  -- Completion-time brackets (`foo` → `foo()`) are handled separately by
+  -- blink.cmp's `completion.accept.auto_brackets` (see `lvim.builtin.cmp`).
+  -- LunarVim historically exposed this as `lvim.builtin.autopairs`.
+  {
+    "saghen/blink.pairs",
+    name = "autopairs",
+    enabled = gate("autopairs"),
+    version = "*",
+    dependencies = { "saghen/blink.lib" },
+    build = function()
+      require("blink.pairs").download():pwait(60000)
+    end,
+    event = { "InsertEnter", "CmdlineEnter" },
+    opts = {},
+    config = setup("autopairs"),
   },
 
   -- Linter dispatcher. Backs the LunarVim `lvim.lsp.null-ls.linters`

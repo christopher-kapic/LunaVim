@@ -328,6 +328,7 @@ describe("plugin modules dispatch into their plugin", function()
     -- mini.nvim explicitly disallows requiring the `mini` umbrella; the
     -- submodule name is the contract.
     { file = "comment", plugin = "mini.comment" },
+    { file = "autopairs", plugin = "blink.pairs" },
   }
 
   for _, m in ipairs(modules) do

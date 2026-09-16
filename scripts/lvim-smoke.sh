@@ -961,9 +961,9 @@ check_phase_22_plugin_count() {
 check_phase_22_load_triggers() {
   # Phase 2.2 spec contract: each gated plugin's lazy-load trigger keys are
   # plan-explicit (`cmd = 'Telescope'`, `event = 'VeryLazy'`, etc.), and
-  # treesitter is pinned to `branch = "master"` because its `main` branch
-  # requires Neovim 0.12 while LunaVim's minimum is 0.11. A regression that
-  # silently dropped one of those keys (or flipped treesitter to `main`)
+  # treesitter is pinned to `branch = "main"` (LunaVim's minimum is Neovim
+  # 0.12). A regression that silently dropped one of those keys (or flipped
+  # treesitter back to `master`)
   # would not be caught by `check_phase_22_plugin_count` — that check only
   # counts entries, not their lazy-loading configuration.
   #
@@ -990,8 +990,7 @@ local function event_has(p, want) \
 end; \
 local ok = true; \
 local function check(cond, msg) if not cond then ok = false; print('FAIL ' .. msg) end end; \
-local ts_want = vim.fn.has('nvim-0.12') == 1 and 'main' or 'master'; \
-check(idx.treesitter ~= nil and idx.treesitter.branch == ts_want, 'treesitter.branch must be ' .. ts_want .. ' on this Neovim'); \
+check(idx.treesitter ~= nil and idx.treesitter.branch == 'main', 'treesitter.branch must be main'); \
 check(idx.treesitter ~= nil and type(idx.treesitter.build) == 'function', 'treesitter.build must be a function'); \
 local ts_build_gated = false; \
 if idx.treesitter and type(idx.treesitter.build) == 'function' then \
@@ -1020,6 +1019,10 @@ check(idx.bufferline ~= nil and idx.bufferline.event == 'VeryLazy', 'bufferline 
 check(idx.whichkey ~= nil and idx.whichkey.event == 'VeryLazy', 'whichkey event must be VeryLazy'); \
 check(idx.gitsigns ~= nil and idx.gitsigns.event == 'BufReadPre', 'gitsigns event must be BufReadPre'); \
 check(idx.lazydev ~= nil and idx.lazydev.ft == 'lua', 'lazydev ft must be lua'); \
+check(idx.autopairs ~= nil and event_has(idx.autopairs, 'InsertEnter'), 'autopairs event must include InsertEnter'); \
+check(idx.autopairs ~= nil and event_has(idx.autopairs, 'CmdlineEnter'), 'autopairs event must include CmdlineEnter'); \
+check(idx.autopairs ~= nil and idx.autopairs.version == '*', 'autopairs version must be *'); \
+check(idx.autopairs ~= nil and type(idx.autopairs.build) == 'function', 'autopairs.build must be a function'); \
 print(ok and 'LOAD_TRIGGERS_OK' or 'LOAD_TRIGGERS_BAD')" \
     -c 'qall!' 2>&1)"
   if ! grep -q '^LOAD_TRIGGERS_OK$' <<<"${output//$'\r'/}"; then
@@ -1274,8 +1277,8 @@ check_min_nvim_version_error() {
     return 1
   fi
 
-  if ! grep -Eq 'LunaVim requires Neovim >= 0\.11\.0' <<<"${stderr//$'\r'/}"; then
-    printf 'min-nvim version check missing required-version "0.11.0" in error on stderr (got rc=%d):\nstdout:\n%s\nstderr:\n%s\n' \
+  if ! grep -Eq 'LunaVim requires Neovim >= 0\.12\.0' <<<"${stderr//$'\r'/}"; then
+    printf 'min-nvim version check missing required-version "0.12.0" in error on stderr (got rc=%d):\nstdout:\n%s\nstderr:\n%s\n' \
       "$rc" "$stdout" "$stderr" >&2
     return 1
   fi
@@ -3666,15 +3669,18 @@ check_phase_51_treesitter_module_present() {
   # presence so a regression that moves/renames it (so the spec's
   # `config = setup("treesitter")` dispatch fails to require it) is caught
   # before the runtime probes below try to exercise its behavior. The grep
-  # also locks down the `nvim-treesitter.configs` entry point — the supported
-  # API on the `master` branch we pin to (the `main` branch's `setup`
-  # function requires Neovim 0.12, see `lua/lvim/plugins/spec.lua`).
+  # also locks down the `main`-branch entry point — `require('nvim-treesitter')`
+  # plus per-buffer `vim.treesitter.start` (see `lua/lvim/plugins/spec.lua`).
   if [[ ! -f lua/lvim/plugins/modules/treesitter.lua ]]; then
     printf 'phase 5.1: lua/lvim/plugins/modules/treesitter.lua is missing\n' >&2
     return 1
   fi
-  if ! grep -Fq 'nvim-treesitter.configs' lua/lvim/plugins/modules/treesitter.lua; then
-    printf 'phase 5.1: treesitter module does not call nvim-treesitter.configs.setup\n' >&2
+  if ! grep -Fq 'nvim-treesitter' lua/lvim/plugins/modules/treesitter.lua; then
+    printf 'phase 5.1: treesitter module does not require nvim-treesitter\n' >&2
+    return 1
+  fi
+  if ! grep -Fq 'vim.treesitter.start' lua/lvim/plugins/modules/treesitter.lua; then
+    printf 'phase 5.1: treesitter module does not wire vim.treesitter.start\n' >&2
     return 1
   fi
 }
@@ -3686,7 +3692,7 @@ check_phase_51_treesitter_defaults_shape() {
   #   auto_install = true
   # A regression that dropped one of these keys (or used a different name
   # like `parsers` instead of `ensure_installed`) would silently change the
-  # surface the module forwards to nvim-treesitter.configs.setup.
+  # surface the module consumes when wiring highlight/indent.
   #
   # `ensure_installed` is checked as a REQUIRED SUBSET plus one invariant,
   # not as an exact list. Pinning the exact list meant every deliberate
@@ -3716,32 +3722,20 @@ check_phase_51_treesitter_defaults_shape() {
 }
 
 check_phase_51_treesitter_setup_forwards_opts() {
-  # Phase 5.1 step 2: the module must forward `lvim.builtin.treesitter` (minus
-  # the `active` toggle) to `nvim-treesitter.configs.setup`. Without this
-  # forwarding the defaults table is dead code — exposed to users but never
-  # consumed. Stub `package.loaded["nvim-treesitter.configs"]` with a fake
-  # whose `setup` captures the opts table, then call the module's setup()
-  # directly and assert the captured opts carry the prescribed shape AND that
-  # `active` was stripped (it would not be a valid nvim-treesitter.configs
-  # option and a regression that forwarded it would pollute the call site).
-  #
-  # The parser-install fields are asserted conditionally on the `tree-sitter`
-  # CLI being on PATH, because the module deliberately neutralises them when
-  # it is not: `setup_master` copies the opts, empties `ensure_installed` and
-  # forces `auto_install = false` so nvim-treesitter does not attempt a build
-  # it cannot complete (it warns once instead). Asserting the populated list
-  # unconditionally made this check fail on any machine without the CLI —
-  # including CI images that do not install it.
+  # Phase 5.1 step 2: the module must read `lvim.builtin.treesitter` (minus
+  # `active`) when wiring the `main` API. Stub `package.loaded["nvim-treesitter"]`
+  # so `install()` captures the parser list, then call setup() and assert the
+  # defaults-shaped subtree drove install/highlight/indent behavior.
   local cfg_dir output
   cfg_dir="$(make_empty_config_dir)"
 
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
-    -c 'lua _G.__ts_opts = nil; package.loaded["nvim-treesitter.configs"] = { setup = function(o) _G.__ts_opts = o end }' \
+    -c 'lua _G.__ts_installed = nil; package.loaded["nvim-treesitter"] = { install = function(p) _G.__ts_installed = p end, indentexpr = function() return 0 end }' \
     -c "lua require('lvim.plugins.modules.treesitter').setup({})" \
-    -c 'lua local o = _G.__ts_opts or {}; local cli = vim.fn.executable("tree-sitter") == 1; local have = {}; for _, p in ipairs(o.ensure_installed or {}) do have[p] = true end; local parsers_ok; if cli then parsers_ok = (have["lua"] == true and have["vim"] == true and have["json"] == true and o.auto_install == true) else parsers_ok = (#(o.ensure_installed or {}) == 0 and o.auto_install == false) end; print("CAPTURED", type(o) == "table", parsers_ok, o.highlight and o.highlight.enable, o.indent and o.indent.enable, o.active == nil)' \
+    -c 'lua local installed = _G.__ts_installed or {}; local have = {}; if type(installed) == "table" then for _, p in ipairs(installed) do have[p] = true end end; local cli = vim.fn.executable("tree-sitter") == 1; local parsers_ok = (not cli) or (have["lua"] == true and have["vim"] == true and have["json"] == true); local t = lvim.builtin.treesitter; print("CAPTURED", parsers_ok, t.highlight.enable, t.indent.enable, t.auto_install)' \
     -c 'qall!' 2>&1)"
-  if ! grep -Eq '^CAPTURED[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
-    printf 'phase 5.1: treesitter module did not forward lvim.builtin.treesitter (minus active) to configs.setup (output: %s)\n' "$output" >&2
+  if ! grep -Eq '^CAPTURED[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
+    printf 'phase 5.1: treesitter module did not consume lvim.builtin.treesitter defaults (output: %s)\n' "$output" >&2
     return 1
   fi
 }
@@ -3749,19 +3743,19 @@ check_phase_51_treesitter_setup_forwards_opts() {
 check_phase_51_treesitter_setup_pcall_guards_missing() {
   # The smoke harness runs with install.missing=false, so nvim-treesitter is
   # not on disk. A regression that dropped the pcall guard around
-  # `require('nvim-treesitter.configs')` would let the missing module raise
-  # at boot time the moment the lazy `config` callback fires (BufReadPost on
-  # any of the smoke checks above that read a .lua file). Force the module
-  # to be unavailable and assert setup() returns without erroring.
+  # `require('nvim-treesitter')` would let the missing module raise at boot
+  # time the moment the lazy `config` callback fires (BufReadPost on any of
+  # the smoke checks above that read a .lua file). Force the module to be
+  # unavailable and assert setup() returns without erroring.
   local cfg_dir output
   cfg_dir="$(make_empty_config_dir)"
 
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
-    -c 'lua package.loaded["nvim-treesitter.configs"] = nil; package.preload["nvim-treesitter.configs"] = nil' \
+    -c 'lua package.loaded["nvim-treesitter"] = nil; package.preload["nvim-treesitter"] = nil' \
     -c "lua local ok, err = pcall(function() require('lvim.plugins.modules.treesitter').setup({}) end); print('PCALL', ok, err == nil)" \
     -c 'qall!' 2>&1)"
   if ! grep -Eq '^PCALL[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
-    printf 'phase 5.1: treesitter module setup raised when nvim-treesitter.configs was unavailable (output: %s)\n' "$output" >&2
+    printf 'phase 5.1: treesitter module setup raised when nvim-treesitter was unavailable (output: %s)\n' "$output" >&2
     return 1
   fi
 }
@@ -3845,11 +3839,10 @@ check_phase_51_open_lua_file_no_error() {
   # The treesitter spec uses `event = { 'BufReadPost', 'BufNewFile' }`, so
   # opening a .lua file fires the lazy-load trigger. With install.missing
   # = false and no on-disk plugin, lazy.nvim reports "Plugin X is not
-  # installed" -- a notice on Neovim 0.12, a raised error on 0.11. That noise
-  # is filtered out by `strip_missing_plugin_errors`; anything left must not be
-  # an error. The
-  # treesitter module's pcall guard around `require('nvim-treesitter.configs')`
-  # is the load-bearing piece that keeps the boot clean.
+  # installed" notice is filtered out by `strip_missing_plugin_errors`; anything
+  # left must not be an error. The treesitter module's pcall guard around
+  # `require('nvim-treesitter')` is the load-bearing piece that keeps the boot
+  # clean.
   local cfg_dir fixture output
   cfg_dir="$(make_empty_config_dir)"
   fixture="$(mktemp -p "$SMOKE_TMP_BASE" phase51-XXXXXX.lua)"
@@ -3868,25 +3861,11 @@ check_phase_51_open_lua_file_no_error() {
 check_phase_51_user_override_forwarded_to_configs_setup() {
   # Phase 5.1 user-override contract: a user that mutates
   # `lvim.builtin.treesitter` from their config (the LunarVim-style flow) must
-  # have that mutation observably forwarded to
-  # `nvim-treesitter.configs.setup`. The sibling
+  # have that mutation observably drive the `main`-branch wiring. The sibling
   # check_phase_51_treesitter_setup_forwards_opts only exercises the DEFAULTS
   # shape — it can't detect a regression where the module reads from a frozen
-  # snapshot of defaults (e.g. captured at module-load time) instead of the
-  # live `_G.lvim.builtin.treesitter` at setup time. This check pins the
-  # user-mutation -> live-read -> configs.setup chain end-to-end. The user
-  # config (loaded by `lua/lvim/config/loader.lua` via `pcall(chunk)`) is
-  # plain Lua executed against the already-populated `_G.lvim` table, so
-  # each statement is a direct in-place mutation — not a tbl_deep_extend
-  # merge:
-  #
-  #   * user config assigns `ensure_installed = { 'python' }`, replacing
-  #     the default 5-language list,
-  #   * user config flips `highlight.enable = false` (a nested scalar
-  #     assignment on the live table),
-  #   * user config flips `auto_install = false`,
-  #   * after the user chunk runs, all three changes must be observable in
-  #     the captured opts table forwarded to `configs.setup`.
+  # snapshot of defaults instead of the live `_G.lvim.builtin.treesitter` at
+  # setup time.
   local cfg_dir output
   cfg_dir="$(mktemp -d -p "$SMOKE_TMP_BASE" treesitter-user-XXXXXX)"
   cat > "$cfg_dir/config.lua" <<'LUA'
@@ -3896,37 +3875,25 @@ lvim.builtin.treesitter.auto_install = false
 LUA
 
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
-    -c 'lua _G.__ts_user_opts = nil; package.loaded["nvim-treesitter.configs"] = { setup = function(o) _G.__ts_user_opts = o end }' \
+    -c 'lua _G.__ts_installed = nil; package.loaded["nvim-treesitter"] = { install = function(p) _G.__ts_installed = p end, indentexpr = function() return 0 end }' \
     -c "lua require('lvim.plugins.modules.treesitter').setup({})" \
-    -c 'lua local o = _G.__ts_user_opts or {}; local cli = vim.fn.executable("tree-sitter") == 1; local parsers_ok; if cli then parsers_ok = (table.concat(o.ensure_installed or {}, ",") == "python") else parsers_ok = (#(o.ensure_installed or {}) == 0) end; print("USER_TS", parsers_ok, o.highlight and o.highlight.enable, o.indent and o.indent.enable, o.auto_install, o.active == nil)' \
+    -c 'lua local installed = _G.__ts_installed or {}; local cli = vim.fn.executable("tree-sitter") == 1; local parsers_ok = (not cli) or (table.concat(installed, ",") == "python"); print("USER_TS", parsers_ok, lvim.builtin.treesitter.highlight.enable, lvim.builtin.treesitter.indent.enable, lvim.builtin.treesitter.auto_install)' \
     -c 'qall!' 2>&1)"
-  # `auto_install` is asserted false in both worlds: the user config sets it
-  # false, and the CLI-missing path forces it false too, so the two agree.
-  # `ensure_installed` is CLI-conditional for the reason documented on
-  # check_phase_51_treesitter_setup_forwards_opts.
-  if ! grep -Eq '^USER_TS[[:space:]]+true[[:space:]]+false[[:space:]]+true[[:space:]]+false[[:space:]]+true$' <<<"${output//$'\r'/}"; then
-    printf 'phase 5.1: user override of lvim.builtin.treesitter did not flow through to configs.setup (output: %s)\n' "$output" >&2
+  if ! grep -Eq '^USER_TS[[:space:]]+true[[:space:]]+false[[:space:]]+true[[:space:]]+false$' <<<"${output//$'\r'/}"; then
+    printf 'phase 5.1: user override of lvim.builtin.treesitter did not flow through to main-branch wiring (output: %s)\n' "$output" >&2
     return 1
   fi
 }
 
 check_phase_51_setup_does_not_mutate_builtin() {
   # Phase 5.1 defensive contract: the module's `vim.deepcopy(builtin)` before
-  # stripping `active` and forwarding to configs.setup must NOT mutate the
-  # live `_G.lvim.builtin.treesitter` table. A regression that dropped the
-  # deepcopy (e.g. replaced it with a shallow `vim.tbl_extend("force", {},
-  # builtin)` — which only shallow-copies the top level, leaving nested
-  # tables shared by reference) wouldn't be caught by the existing
-  # forwards_opts/defaults_shape checks because they observe the captured
-  # opts, not the source. Pin both top-level (active must remain `true` on
-  # the live table after setup) and nested (highlight.enable must remain
-  # `true` after setup, even if a hypothetical regression mutated the
-  # captured opts copy's `highlight.enable` to false).
+  # stripping `active` must NOT mutate the live `_G.lvim.builtin.treesitter`
+  # table while wiring highlight/indent autocmds.
   local cfg_dir output
   cfg_dir="$(make_empty_config_dir)"
 
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
-    -c 'lua package.loaded["nvim-treesitter.configs"] = { setup = function(o) o.active = "MUTATED"; if o.highlight then o.highlight.enable = "MUTATED" end end }' \
+    -c 'lua package.loaded["nvim-treesitter"] = { install = function() end, indentexpr = function() return 0 end }' \
     -c "lua require('lvim.plugins.modules.treesitter').setup({})" \
     -c 'lua local t = lvim.builtin.treesitter; local have = {}; for _, p in ipairs(t.ensure_installed or {}) do have[p] = true end; print("LIVE", t.active, t.highlight.enable, t.indent.enable, t.auto_install, have["lua"] == true and have["vim"] == true)' \
     -c 'qall!' 2>&1)"
@@ -3936,7 +3903,7 @@ check_phase_51_setup_does_not_mutate_builtin() {
   # check_phase_51_treesitter_defaults_shape and broke for the same reason
   # (parsers were added to defaults.lua and the literal was never updated).
   if ! grep -Eq '^LIVE[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true[[:space:]]+true$' <<<"${output//$'\r'/}"; then
-    printf 'phase 5.1: configs.setup observably mutated lvim.builtin.treesitter (output: %s)\n' "$output" >&2
+    printf 'phase 5.1: treesitter setup observably mutated lvim.builtin.treesitter (output: %s)\n' "$output" >&2
     return 1
   fi
 }

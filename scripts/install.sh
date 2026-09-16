@@ -112,7 +112,7 @@ detect_os() {
   esac
 }
 
-version_at_least_0_11() {
+version_at_least_0_12() {
   local version="$1"
   local major minor patch
 
@@ -124,7 +124,7 @@ version_at_least_0_11() {
   if (( major > 0 )); then
     return 0
   fi
-  if (( major == 0 && minor >= 11 )); then
+  if (( major == 0 && minor >= 12 )); then
     return 0
   fi
   return 1
@@ -147,8 +147,8 @@ check_prerequisites() {
     die "could not parse Neovim version from: $version_line"
   fi
 
-  if ! version_at_least_0_11 "$version"; then
-    die "LunaVim requires Neovim >= 0.11; found $version_line"
+  if ! version_at_least_0_12 "$version"; then
+    die "LunaVim requires Neovim >= 0.12; found $version_line"
   fi
 
   log "Prerequisites found: git, Neovim $version"

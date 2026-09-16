@@ -6,7 +6,7 @@
 
 local M = {}
 
-local MIN_NVIM = { major = 0, minor = 11, patch = 0 }
+local MIN_NVIM = { major = 0, minor = 12, patch = 0 }
 
 local function check_nvim_version()
   local current = vim.version()
@@ -23,7 +23,7 @@ local function check_nvim_version()
   else
     vim.health.error(
       string.format("%s is older than the required %d.%d.%d", label, MIN_NVIM.major, MIN_NVIM.minor, MIN_NVIM.patch),
-      { "Upgrade Neovim to at least 0.11" }
+      { "Upgrade Neovim to at least 0.12" }
     )
   end
 end
