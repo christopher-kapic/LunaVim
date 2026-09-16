@@ -498,25 +498,21 @@ return {
     -- by the module and is not exposed for user override here; Phase 6 may
     -- extend the surface if needed.
     comment = { active = true, options = {} },
-    -- Auto-pairs for quotes, brackets, and parentheses via blink.pairs. The
-    -- whole subtree (minus `active`) is forwarded to
-    -- `require("blink.pairs").setup(opts)` by
-    -- `lvim/plugins/modules/autopairs.lua`.
+    -- Auto-pairs for quotes, brackets, and parentheses via mini.pairs.
+    -- `options` is forwarded to `require("mini.pairs").setup(options)` by
+    -- `lvim/plugins/modules/autopairs.lua`. `disabled_filetypes` is
+    -- LunaVim-owned (mini.pairs uses `vim.b.minipairs_disable`) and accepts
+    -- a list (`{ "TelescopePrompt" }`) or a map (`{ TelescopePrompt = true }`).
     --
     -- Completion-time brackets (`foo` → `foo()`) are owned by blink.cmp's
     -- `completion.accept.auto_brackets` under `lvim.builtin.cmp`, not here.
     -- Disable with `lvim.builtin.autopairs.active = false` (LunarVim parity).
     autopairs = {
       active = true,
-      mappings = {
-        enabled = true,
-        cmdline = true,
-        disabled_filetypes = { "TelescopePrompt" },
+      options = {
+        modes = { insert = true, command = true, terminal = false },
       },
-      highlights = {
-        enabled = true,
-        cmdline = true,
-      },
+      disabled_filetypes = { "TelescopePrompt" },
     },
     -- Project-root detection, implemented natively in `lvim/core/project.lua`
     -- rather than by a plugin -- see that file for why.
@@ -627,7 +623,7 @@ return {
     --
     -- `completion.accept.auto_brackets` adds `()` when accepting function or
     -- method completions. General delimiter pairing while typing is handled by
-    -- blink.pairs (`lvim.builtin.autopairs`), not here.
+    -- mini.pairs (`lvim.builtin.autopairs`), not here.
     cmp = {
       active = true,
       keymap = { preset = "default" },

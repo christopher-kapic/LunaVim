@@ -19,7 +19,7 @@ surfaces are still `lvim` — old muscle memory carries over.
 - Built on a current plugin set: `lazy.nvim`, `mason.nvim` +
   `nvim-lspconfig`, `nvim-treesitter`, `telescope.nvim`, `nvim-tree.lua`,
   `gitsigns.nvim`, `which-key.nvim`, `lualine.nvim`,
-  `bufferline.nvim`, `toggleterm.nvim`, `mini.comment`,
+  `bufferline.nvim`, `toggleterm.nvim`, `mini.comment`, `mini.pairs`,
   `indent-blankline.nvim`.
 - Linux and macOS supported today.
 
@@ -69,9 +69,11 @@ Two options, both safe to re-run:
 
 - **In Neovim:** `:LvimUpdate` runs `git pull --rebase --autostash` in
   the LunaVim base dir to pull the latest source. When the pull moves
-  HEAD it then chains a plugin sync itself, so newly-shipped core plugins
-  land without a manual follow-up (run `:LvimSyncCorePlugins` yourself
-  only if you cancelled that step).
+  HEAD it reloads the core plugin spec into this session and chains a
+  plugin sync, so same-name URL swaps and newly-shipped core plugins
+  land without a restart (run `:LvimSyncCorePlugins` yourself only if
+  you cancelled that step, or if spec reload failed and you were asked
+  to restart).
 - **From the shell:** re-run the installer. It's idempotent —
   it fast-forwards the existing checkout, rewrites the `lvim` launcher,
   re-syncs the core plugins, and fetches the pinned `tree-sitter` CLI
@@ -83,8 +85,11 @@ curl -fsSL https://raw.githubusercontent.com/christopher-kapic/LunaVim/master/sc
 
 The in-Neovim sync applies the pinned plugin snapshot from
 `snapshots/default.json` (answer "No" to the lockfile-overwrite prompt to
-keep your own pins — missing plugins are still installed at their pins).
-The installer instead syncs plugins at their tracked branches.
+keep your own pins — missing plugins are still installed at their pins,
+removed plugins are cleaned, and any core plugin whose git URL changed
+is re-cloned at the snapshot pin). If a core pin cannot be checked out in
+the new repository, the snapshot pin is used once. The installer instead
+syncs plugins at their tracked branches.
 
 ## Uninstall
 

@@ -325,10 +325,10 @@ describe("plugin modules dispatch into their plugin", function()
     { file = "terminal", plugin = "toggleterm" },
     { file = "whichkey", plugin = "which-key" },
     { file = "indentlines", plugin = "ibl" },
-    -- mini.nvim explicitly disallows requiring the `mini` umbrella; the
-    -- submodule name is the contract.
+    -- Standalone mini.* repos still publish under the `mini.<module>` name;
+    -- the umbrella `require("mini")` is explicitly disallowed by the library.
     { file = "comment", plugin = "mini.comment" },
-    { file = "autopairs", plugin = "blink.pairs" },
+    { file = "autopairs", plugin = "mini.pairs" },
   }
 
   for _, m in ipairs(modules) do
@@ -377,5 +377,48 @@ describe("commands", function()
   -- check has to fire.
   it(":LvimSyncCorePlugins still reaches TSUpdate", function()
     assert_code_contains("lua/lvim/core/commands.lua", "TSUpdate", "reference TSUpdate")
+  end)
+
+  -- Bang and keep-pins both go through install_restore_clean; a regression
+  -- that restored without clean left spec-removed plugins (blink.lib) on disk.
+  it(":LvimSyncCorePlugins cleans spec-removed plugins after restore", function()
+    assert_code_contains("lua/lvim/core/commands.lua", "lazy.clean()", "call lazy.clean() after restore")
+  end)
+
+  it("ships plugin_lock helpers for URL-changed lockfile pins", function()
+    assert.is_true(
+      vim.fn.filereadable(path("lua/lvim/core/plugin_lock.lua")) == 1,
+      "lua/lvim/core/plugin_lock.lua is missing"
+    )
+    assert_code_contains(
+      "lua/lvim/core/commands.lua",
+      "rebase_lockfile_for_origin_changes",
+      "rebase lockfile pins whose git origin no longer matches the spec URL"
+    )
+    assert_code_contains(
+      "lua/lvim/core/commands.lua",
+      "evict_mismatched_checkouts",
+      "delete origin-mismatched checkouts before install"
+    )
+    assert_code_contains(
+      "lua/lvim/core/commands.lua",
+      "Lock._loaded = false",
+      "invalidate lazy's lockfile cache after writing pins"
+    )
+    assert_code_contains(
+      "lua/lvim/core/plugin_lock.lua",
+      "pins_for_failed_checkouts",
+      "retry snapshot pins when a core checkout fails"
+    )
+    assert_code_contains(
+      "lua/lvim/core/plugin_lock.lua",
+      "new_error_names",
+      "count only error tasks created by this runner"
+    )
+    assert_code_contains(
+      "lua/lvim/core/commands.lua",
+      "refresh_lazy_spec",
+      "reload the plugin spec after :LvimUpdate before syncing"
+    )
   end)
 end)

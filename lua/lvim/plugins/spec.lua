@@ -321,12 +321,15 @@ return {
     config = setup("alpha"),
   },
 
-  -- mini.nvim ships many independent modules; we only consume mini.comment
-  -- for now (Phase 6 calls `require('mini.comment').setup()` from the
-  -- comment module — the umbrella `require('mini')` is explicitly disallowed
-  -- by the library).
+  -- Standalone mini.comment (not the mini.nvim umbrella). The umbrella ships
+  -- every mini.* module under `lua/mini/`, so pairing it with a second
+  -- standalone mini.* plugin (autopairs → mini.pairs) would put two trees
+  -- that both own `lua/mini/` on rtp. Independent `lvim.builtin.comment` /
+  -- `lvim.builtin.autopairs` toggles also require separate spec entries;
+  -- a shared umbrella gated on one builtin cannot drop only one module.
+  -- `require('mini')` is explicitly disallowed by the library.
   {
-    "echasnovski/mini.nvim",
+    "echasnovski/mini.comment",
     name = "comment",
     enabled = gate("comment"),
     event = { "BufReadPost", "BufNewFile" },
@@ -425,25 +428,15 @@ return {
     config = setup("cmp"),
   },
 
-  -- Auto-pairs for quotes, brackets, and parentheses.
-  --
-  -- blink.pairs ships in the blink.nvim ecosystem (same author as blink.cmp).
-  -- `version = "*"` tracks tagged releases with prebuilt parser binaries,
-  -- mirroring the blink.cmp pin rationale: without a tag, lazy.nvim checks out
-  -- the default branch and the Rust parser must be built locally.
-  --
-  -- Completion-time brackets (`foo` → `foo()`) are handled separately by
-  -- blink.cmp's `completion.accept.auto_brackets` (see `lvim.builtin.cmp`).
-  -- LunarVim historically exposed this as `lvim.builtin.autopairs`.
+  -- Auto-pairs for quotes, brackets, and parentheses via standalone
+  -- mini.pairs (Lua-only; no native parser, no build hook). Completion-time
+  -- brackets (`foo` → `foo()`) stay with blink.cmp's
+  -- `completion.accept.auto_brackets` (see `lvim.builtin.cmp`). LunarVim
+  -- historically exposed this as `lvim.builtin.autopairs`.
   {
-    "saghen/blink.pairs",
+    "echasnovski/mini.pairs",
     name = "autopairs",
     enabled = gate("autopairs"),
-    version = "*",
-    dependencies = { "saghen/blink.lib" },
-    build = function()
-      require("blink.pairs").download():pwait(60000)
-    end,
     event = { "InsertEnter", "CmdlineEnter" },
     opts = {},
     config = setup("autopairs"),

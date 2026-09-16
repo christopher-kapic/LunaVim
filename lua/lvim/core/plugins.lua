@@ -74,8 +74,11 @@ end
 -- in the install dir, or `:LvimUpdate` before it chained a sync): lazy.nvim
 -- only reports the gap per lazy-load trigger, one cryptic
 -- "Plugin <name> is not installed" error at a time, with no hint at the
--- remedy. One scheduled WARN naming the full missing set replaces that
--- confusion with the fix.
+-- remedy. The same advisory also names plugins whose on-disk git origin
+-- no longer matches the spec URL (same lazy `name`, new repo) — those
+-- still look "installed" to lazy.nvim, so pairing/comment would otherwise
+-- silently no-op after a source update. One scheduled WARN naming the
+-- full set replaces that confusion with the fix.
 --
 -- Gated on an attached UI: the smoke harness boots headless with
 -- `install.missing = false` and deliberately runs without core plugins on
@@ -95,9 +98,10 @@ local function warn_missing_plugins()
     return
   end
 
+  local plugin_lock = require("lvim.core.plugin_lock")
   local missing = {}
   for _, plugin in pairs(config.plugins) do
-    if plugin._.installed ~= true then
+    if plugin._.installed ~= true or plugin_lock.plugin_origin_mismatches(plugin) then
       missing[#missing + 1] = plugin.name
     end
   end
@@ -109,7 +113,7 @@ local function warn_missing_plugins()
   vim.schedule(function()
     vim.notify(
       string.format(
-        "lvim: %d plugin%s missing from the runtime dir (%s). Run :LvimSyncCorePlugins to install them.",
+        "lvim: %d plugin%s missing from the runtime dir or cloned from a different repo (%s). Run :LvimSyncCorePlugins to install them.",
         #missing,
         #missing == 1 and "" or "s",
         table.concat(missing, ", ")

@@ -405,7 +405,7 @@ step("(f) gcc on TSX uses {/* %s */} commentstring", function()
 
   -- Confirm mini.comment is loaded and its `gcc` keymap is in place — opening
   -- Component.tsx above fired BufReadPost which lazy-loads the `comment`
-  -- plugin entry (mini.nvim → mini.comment.setup), but the assert here makes
+  -- plugin entry (mini.comment → mini.comment.setup), but the assert here makes
   -- the failure mode "no gcc keymap" instead of "gcc produced no change".
   if not pcall(require, "mini.comment") then
     error("mini.comment not available after plugin install")
@@ -553,6 +553,61 @@ resync_probe() {
 }
 resync_probe "accept" 'LvimSyncCorePlugins!' "$TMP/resync-accept-log"
 resync_probe "decline" 'LvimSyncCorePlugins' "$TMP/resync-decline-log"
+
+# Same-name / new-URL: the lockfile has no URL, so a leftover
+# `lazy/autopairs` cloned from blink.pairs (or a lockfile SHA from that
+# repo with the dir missing) must still land on mini.pairs at the snapshot
+# pin. Bang evicts the mismatched origin; keep-pins with no checkout has
+# to fail the old SHA and retry the snapshot pin.
+echo "[integration-smoke] resync: URL-changed autopairs reclones at snapshot pin"
+AUTOPAIRS_DIR="$RUNTIME_DIR/lazy/autopairs"
+AUTOPAIRS_PIN="$(python3 - "$REPO_ROOT/snapshots/default.json" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1]))["autopairs"]["commit"])
+PY
+)"
+wait_autopairs_pin() {
+  local label="$1" cmd="$2" log="$3" normalized rc
+  set +e
+  LVIM_PAIRS_DIR="$AUTOPAIRS_DIR" LVIM_PAIRS_PIN="$AUTOPAIRS_PIN" \
+    nvim --headless \
+      --cmd "let g:lunavim_isolated_xdg = v:true" \
+      -u "$REPO_ROOT/init.lua" \
+      -c "$cmd" \
+      -c 'lua local d = vim.env.LVIM_PAIRS_DIR; local pin = vim.env.LVIM_PAIRS_PIN; local ok = vim.wait(120000, function() if vim.fn.isdirectory(d) ~= 1 then return false end; local head = vim.fn.system({ "git", "-C", d, "rev-parse", "HEAD" }); local origin = vim.fn.system({ "git", "-C", d, "remote", "get-url", "origin" }); return vim.v.shell_error == 0 and vim.trim(head) == pin and vim.trim(origin):find("mini.pairs", 1, true) ~= nil end, 250); if ok then print("PAIRS_OK") else print("PAIRS_FAIL") end' \
+      -c 'qall!' > "$log" 2>&1
+  rc=$?
+  set -e
+  normalized="$(tr -d '\r' < "$log")"
+  if grep -q 'install failed after snapshot-pin retry' <<<"$normalized"; then
+    printf '[integration-smoke] %s URL-swap probe treated a retry as failure:\n%s\n' "$label" "$normalized" >&2
+    exit 1
+  fi
+  if (( rc != 0 )) || ! grep -q '^PAIRS_OK$' <<<"$normalized"; then
+    printf '[integration-smoke] %s URL-swap probe failed (rc=%d):\n%s\n' "$label" "$rc" "$normalized" >&2
+    exit 1
+  fi
+}
+
+if [[ ! -d "$AUTOPAIRS_DIR/.git" ]]; then
+  printf '[integration-smoke] autopairs checkout missing at %s before URL-swap probe\n' "$AUTOPAIRS_DIR" >&2
+  exit 1
+fi
+git -C "$AUTOPAIRS_DIR" remote set-url origin "https://github.com/saghen/blink.pairs.git"
+wait_autopairs_pin "bang-wrong-origin" 'LvimSyncCorePlugins!' "$TMP/pairs-bang-log"
+
+rm -rf "$AUTOPAIRS_DIR"
+python3 - "$CONFIG_DIR/lazy-lock.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path) as fh:
+    lock = json.load(fh)
+lock["autopairs"]["commit"] = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+with open(path, "w") as fh:
+    json.dump(lock, fh, indent=2)
+    fh.write("\n")
+PY
+wait_autopairs_pin "keep-pins-stale-sha" 'LvimSyncCorePlugins' "$TMP/pairs-keep-log"
 
 if ! grep -q "^INTEGRATION_OK$" <<<"$log_normalized"; then
   echo "[integration-smoke] driver did not reach INTEGRATION_OK" >&2

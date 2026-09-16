@@ -77,6 +77,7 @@ end
 -- assigns to this local (a `local function` there would shadow the
 -- placeholder instead, leaving lvim_update calling nil).
 local sync_core_plugins
+local refresh_lazy_spec
 
 -- :LvimUpdate runs `git pull --rebase --autostash` inside the LunaVim base
 -- directory and streams every captured line through vim.notify. Using
@@ -149,6 +150,18 @@ local function lvim_update()
         return
       end
 
+      -- lazy.nvim will not re-run setup() in this session. Reload the
+      -- core spec into Config.plugins so same-name URL swaps (mini.nvim →
+      -- mini.comment, blink.pairs → mini.pairs) are visible to eviction
+      -- and rebase before we sync. If that fails, skip the in-session
+      -- sync rather than keep-pinning against the pre-pull spec.
+      if not refresh_lazy_spec() then
+        vim.notify(
+          "LvimUpdate: could not reload the plugin spec in this session; restart Neovim and run :LvimSyncCorePlugins",
+          vim.log.levels.WARN
+        )
+        return
+      end
       vim.notify("LvimUpdate: syncing core plugins after update", vim.log.levels.INFO)
       sync_core_plugins(false)
     end,
@@ -168,7 +181,13 @@ end
 -- keeps the user's pins but still installs missing entries at them,
 -- restores drifted checkouts, and cleans removed plugins — see the
 -- confirm block in `sync_core_plugins` below for why "No" must not be a
--- no-op.
+-- no-op. Both branches run `lazy.clean()` so a spec-removed plugin
+-- (e.g. `blink.lib` after autopairs moved to mini.pairs) does not stay
+-- on disk. Keep-pins also rewrites lockfile entries whose on-disk git
+-- origin no longer matches the spec URL, swapping in the snapshot pin.
+-- Those checkouts are then deleted so install re-clones the new URL at
+-- that pin; the lockfile is re-applied after install because lazy.nvim
+-- Lock.update()s from on-disk SHAs when install finishes.
 local function snapshot_path()
   local base = call_or(_G.get_lvim_base_dir, "")
   if base == "" then
@@ -267,6 +286,362 @@ local function maybe_schedule_tsupdate()
   end
 end
 
+local function collect_error_tasks()
+  local seen = {}
+  local ok_c, Config = pcall(require, "lazy.core.config")
+  if not ok_c or type(Config) ~= "table" or type(Config.plugins) ~= "table" then
+    return seen
+  end
+  for _, plugin in pairs(Config.plugins) do
+    if type(plugin) == "table" and type(plugin.name) == "string" then
+      for _, task in ipairs((plugin._ or {}).tasks or {}) do
+        local ok, has = pcall(function()
+          return task:has_errors()
+        end)
+        if ok and has then
+          seen[task] = plugin.name
+        end
+      end
+    end
+  end
+  return seen
+end
+
+-- lazy.install/restore/clean each return a runner with :wait(cb). Smoke
+-- stubs often return nothing; treat that as already finished so tests that
+-- only record the call still see restore+clean. `cb` receives a list of
+-- plugin names that reported *new* task errors since this wait started, or
+-- nil on success. Pre-existing error tasks (lazy keeps them for the UI)
+-- are ignored so a successful snapshot-pin retry is not treated as failure.
+local function wait_runner(runner, cb)
+  local before = collect_error_tasks()
+  local function finish()
+    local failed = require("lvim.core.plugin_lock").new_error_names(before, collect_error_tasks())
+    cb(#failed > 0 and failed or nil)
+  end
+  if type(runner) == "table" and type(runner.wait) == "function" then
+    runner:wait(finish)
+    return
+  end
+  finish()
+end
+
+-- lazy.manage.lock.load() caches the decoded lockfile in Lock._loaded.
+-- After we write pins, that cache must be dropped or install/restore
+-- keep using the pre-write table. lazy.install also Lock.update()s from
+-- on-disk SHAs when it finishes, which would clobber snapshot/rebased
+-- pins for still-installed plugins; the caller re-writes `intended_bytes`
+-- after install and invalidates again before restore.
+local function invalidate_lock_cache()
+  local ok, Lock = pcall(require, "lazy.manage.lock")
+  if ok and type(Lock) == "table" then
+    Lock._loaded = false
+  end
+end
+
+local function mark_uninstalled(names)
+  local ok_cfg, Config = pcall(require, "lazy.core.config")
+  if not ok_cfg or type(Config) ~= "table" or type(Config.plugins) ~= "table" then
+    return
+  end
+  local want = {}
+  for _, name in ipairs(names) do
+    want[name] = true
+  end
+  for _, plugin in pairs(Config.plugins) do
+    if type(plugin) == "table" and want[plugin.name] then
+      plugin._ = plugin._ or {}
+      plugin._.installed = false
+    end
+  end
+end
+
+local function evict_mismatched_checkouts()
+  local ok_cfg, Config = pcall(require, "lazy.core.config")
+  if not ok_cfg or type(Config) ~= "table" or type(Config.plugins) ~= "table" then
+    return {}
+  end
+  local plugin_lock = require("lvim.core.plugin_lock")
+  local root = Config.options and Config.options.root
+  local victims = plugin_lock.list_mismatched(Config.plugins, root)
+  local evicted = {}
+  for _, item in ipairs(victims) do
+    if vim.fn.delete(item.dir, "rf") == 0 then
+      evicted[#evicted + 1] = item.name
+    else
+      vim.notify("LvimSyncCorePlugins: failed to remove stale checkout " .. item.dir, vim.log.levels.WARN)
+    end
+  end
+  if #evicted > 0 then
+    local ok_state = pcall(function()
+      require("lazy.core.plugin").update_state()
+    end)
+    if not ok_state then
+      mark_uninstalled(evicted)
+    end
+  end
+  return evicted
+end
+
+local function drop_error_tasks(names)
+  local ok_cfg, Config = pcall(require, "lazy.core.config")
+  if not ok_cfg or type(Config) ~= "table" or type(Config.plugins) ~= "table" or type(names) ~= "table" then
+    return
+  end
+  local want = {}
+  for _, name in ipairs(names) do
+    want[name] = true
+  end
+  for _, plugin in pairs(Config.plugins) do
+    if type(plugin) == "table" and want[plugin.name] then
+      plugin._ = plugin._ or {}
+      local kept = {}
+      for _, task in ipairs(plugin._.tasks or {}) do
+        local ok, running = pcall(function()
+          return task:running()
+        end)
+        if ok and running then
+          kept[#kept + 1] = task
+        end
+      end
+      plugin._.tasks = kept
+    end
+  end
+end
+
+local function evict_named_checkouts(names)
+  local ok_cfg, Config = pcall(require, "lazy.core.config")
+  if not ok_cfg or type(Config) ~= "table" or type(Config.plugins) ~= "table" or type(names) ~= "table" then
+    return
+  end
+  local plugin_lock = require("lvim.core.plugin_lock")
+  local root = Config.options and Config.options.root
+  local want = {}
+  for _, name in ipairs(names) do
+    want[name] = true
+  end
+  local evicted = {}
+  for _, plugin in pairs(Config.plugins) do
+    if type(plugin) == "table" and want[plugin.name] and plugin_lock.is_under_root(plugin.dir, root) then
+      if vim.fn.delete(plugin.dir, "rf") ~= 0 then
+        vim.notify("LvimSyncCorePlugins: failed to remove stale checkout " .. plugin.dir, vim.log.levels.WARN)
+      end
+      evicted[#evicted + 1] = plugin.name
+    end
+  end
+  if #evicted > 0 then
+    pcall(function()
+      require("lazy.core.plugin").update_state()
+    end)
+    mark_uninstalled(evicted)
+  end
+end
+
+local function install_restore_clean(lazy, lockfile, intended_bytes, snapshot)
+  local retried = false
+
+  local function assert_pins()
+    if type(intended_bytes) ~= "string" then
+      return true
+    end
+    local wrote, write_err = write_file(lockfile, intended_bytes)
+    if not wrote then
+      vim.notify(
+        string.format("LvimSyncCorePlugins: failed to write %s: %s", lockfile, write_err),
+        vim.log.levels.ERROR
+      )
+      return false
+    end
+    invalidate_lock_cache()
+    return true
+  end
+
+  local function finish_with_clean()
+    wait_runner(lazy.clean(), function()
+      maybe_schedule_tsupdate()
+    end)
+  end
+
+  local function try_snapshot_pins(failed)
+    if retried or type(snapshot) ~= "table" or type(failed) ~= "table" then
+      return false
+    end
+    local raw = read_file(lockfile) or intended_bytes
+    local ok_lock, lock = pcall(vim.json.decode, raw or "")
+    if not ok_lock or type(lock) ~= "table" then
+      lock = {}
+    end
+    local plugin_lock = require("lvim.core.plugin_lock")
+    local next_lock, applied = plugin_lock.pins_for_failed_checkouts(lock, snapshot, failed)
+    if #applied == 0 then
+      return false
+    end
+    retried = true
+    intended_bytes = plugin_lock.encode(next_lock)
+    vim.notify(
+      string.format("LvimSyncCorePlugins: checkout failed; retrying %s at snapshot pins", table.concat(applied, ", ")),
+      vim.log.levels.WARN
+    )
+    evict_named_checkouts(applied)
+    drop_error_tasks(applied)
+    return assert_pins()
+  end
+
+  if not assert_pins() then
+    return
+  end
+  wait_runner(lazy.install({ lockfile = true }), function(failed)
+    -- install's completion Lock.update() rewrote the file from whatever
+    -- was still on disk. Put the intended pins back so restore checkouts
+    -- the snapshot / rebased SHAs, not the pre-eviction blink.pairs
+    -- / mini.nvim commits.
+    if failed then
+      if try_snapshot_pins(failed) then
+        wait_runner(lazy.install({ lockfile = true }), function(retry_failed)
+          if retry_failed then
+            vim.notify(
+              "LvimSyncCorePlugins: install failed after snapshot-pin retry ("
+                .. table.concat(retry_failed, ", ")
+                .. ")",
+              vim.log.levels.ERROR
+            )
+            finish_with_clean()
+            return
+          end
+          if not assert_pins() then
+            finish_with_clean()
+            return
+          end
+          wait_runner(lazy.restore(), function(restore_failed)
+            if restore_failed then
+              vim.notify(
+                "LvimSyncCorePlugins: restore failed (" .. table.concat(restore_failed, ", ") .. ")",
+                vim.log.levels.ERROR
+              )
+            elseif not assert_pins() then
+              finish_with_clean()
+              return
+            end
+            finish_with_clean()
+          end)
+        end)
+        return
+      end
+      vim.notify("LvimSyncCorePlugins: install failed (" .. table.concat(failed, ", ") .. ")", vim.log.levels.ERROR)
+      finish_with_clean()
+      return
+    end
+    if not assert_pins() then
+      finish_with_clean()
+      return
+    end
+    wait_runner(lazy.restore(), function(restore_failed)
+      if restore_failed then
+        if try_snapshot_pins(restore_failed) then
+          wait_runner(lazy.restore(), function(retry_failed)
+            if retry_failed then
+              vim.notify(
+                "LvimSyncCorePlugins: restore failed after snapshot-pin retry ("
+                  .. table.concat(retry_failed, ", ")
+                  .. ")",
+                vim.log.levels.ERROR
+              )
+            elseif not assert_pins() then
+              finish_with_clean()
+              return
+            end
+            finish_with_clean()
+          end)
+          return
+        end
+        vim.notify(
+          "LvimSyncCorePlugins: restore failed (" .. table.concat(restore_failed, ", ") .. ")",
+          vim.log.levels.ERROR
+        )
+        finish_with_clean()
+        return
+      end
+      -- Re-assert after restore; clean's Lock.update then drops
+      -- spec-removed names (e.g. blink.lib) from the lockfile.
+      if not assert_pins() then
+        finish_with_clean()
+        return
+      end
+      finish_with_clean()
+    end)
+  end)
+end
+
+-- After `:LvimUpdate` moves HEAD, package.loaded still has the pre-pull
+-- spec. Re-parse `final_spec()` into lazy's Config so URL-changed names
+-- and new entries exist before install/restore/clean.
+refresh_lazy_spec = function()
+  package.loaded["lvim.plugins.spec"] = nil
+  package.loaded["lvim.plugins"] = nil
+  local ok_spec, spec = pcall(function()
+    return require("lvim.plugins").final_spec()
+  end)
+  if not ok_spec or type(spec) ~= "table" then
+    return false
+  end
+  local ok_cfg, Config = pcall(require, "lazy.core.config")
+  if not ok_cfg or type(Config) ~= "table" or type(Config.options) ~= "table" then
+    return false
+  end
+  Config.options.spec = spec
+  local ok_load = pcall(function()
+    local Plugin = require("lazy.core.plugin")
+    Plugin.load()
+    Plugin.update_state()
+  end)
+  return ok_load == true
+end
+
+local function collect_installed_origins()
+  local ok, Config = pcall(require, "lazy.core.config")
+  if not ok or type(Config) ~= "table" or type(Config.plugins) ~= "table" then
+    return {}
+  end
+  local plugin_lock = require("lvim.core.plugin_lock")
+  local installed = {}
+  for _, plugin in pairs(Config.plugins) do
+    if type(plugin) == "table" and type(plugin.name) == "string" then
+      installed[plugin.name] = {
+        spec_url = plugin.url,
+        origin = plugin_lock.read_origin(plugin.dir),
+      }
+    end
+  end
+  return installed
+end
+
+local function rebase_lockfile_for_origin_changes(lockfile, snapshot)
+  local contents = read_file(lockfile)
+  if not contents or contents:match("^%s*$") then
+    return {}
+  end
+  local ok, lock = pcall(vim.json.decode, contents)
+  if not ok or type(lock) ~= "table" then
+    return {}
+  end
+
+  local plugin_lock = require("lvim.core.plugin_lock")
+  local next_lock, rewritten = plugin_lock.rebase_stale_pins(lock, snapshot, collect_installed_origins())
+  if #rewritten == 0 then
+    return rewritten
+  end
+
+  local wrote, write_err = write_file(lockfile, plugin_lock.encode(next_lock))
+  if not wrote then
+    vim.notify(
+      string.format("LvimSyncCorePlugins: failed to rewrite stale lockfile pins at %s: %s", lockfile, write_err),
+      vim.log.levels.ERROR
+    )
+    return {}
+  end
+  return rewritten
+end
+
 sync_core_plugins = function(bang)
   local ok, lazy = pcall(require, "lazy")
   if not ok then
@@ -315,15 +690,31 @@ sync_core_plugins = function(bang)
       -- discarding exactly the pins the user just declined to give up.
       -- This branch also covers headless runs, where confirm() cannot
       -- prompt and answers with the default choice.
+      local rewritten = rebase_lockfile_for_origin_changes(lockfile, snapshot)
+      if #rewritten > 0 then
+        vim.notify(
+          string.format(
+            "LvimSyncCorePlugins: snapshot pins applied for plugins whose repo URL changed (%s)",
+            table.concat(rewritten, ", ")
+          ),
+          vim.log.levels.INFO
+        )
+      end
+      local evicted = evict_mismatched_checkouts()
+      if #evicted > 0 then
+        vim.notify(
+          string.format(
+            "LvimSyncCorePlugins: removed stale checkouts so they re-clone (%s)",
+            table.concat(evicted, ", ")
+          ),
+          vim.log.levels.INFO
+        )
+      end
       vim.notify(
         "LvimSyncCorePlugins: keeping your lazy-lock.json pins; installing missing plugins and cleaning removed ones",
         vim.log.levels.INFO
       )
-      lazy.install({ lockfile = true }):wait(function()
-        lazy.restore()
-        lazy.clean()
-      end)
-      maybe_schedule_tsupdate()
+      install_restore_clean(lazy, lockfile, read_file(lockfile), snapshot)
       return
     end
   end
@@ -345,10 +736,19 @@ sync_core_plugins = function(bang)
   -- the lockfile commit. Without this, :LvimSyncCorePlugins! on a machine
   -- missing core plugins re-pinned the installed set and silently left the
   -- missing ones absent (lazy.restore() alone never installs).
-  lazy.install({ lockfile = true }):wait(function()
-    lazy.restore()
-  end)
-  maybe_schedule_tsupdate()
+  --
+  -- Origin-mismatched dirs (same lazy name, new git URL) are evicted first
+  -- so install does not skip them as "already installed". The lockfile
+  -- bytes are re-applied after install because lazy.install Lock.update()s
+  -- from on-disk SHAs and would otherwise restore the old repo's commit.
+  local evicted = evict_mismatched_checkouts()
+  if #evicted > 0 then
+    vim.notify(
+      string.format("LvimSyncCorePlugins: removed stale checkouts so they re-clone (%s)", table.concat(evicted, ", ")),
+      vim.log.levels.INFO
+    )
+  end
+  install_restore_clean(lazy, lockfile, contents, snapshot)
 end
 
 -- :LvimSyncCorePlugins entry point: a thin adapter from the user-command

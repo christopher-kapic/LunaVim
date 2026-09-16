@@ -1021,8 +1021,7 @@ check(idx.gitsigns ~= nil and idx.gitsigns.event == 'BufReadPre', 'gitsigns even
 check(idx.lazydev ~= nil and idx.lazydev.ft == 'lua', 'lazydev ft must be lua'); \
 check(idx.autopairs ~= nil and event_has(idx.autopairs, 'InsertEnter'), 'autopairs event must include InsertEnter'); \
 check(idx.autopairs ~= nil and event_has(idx.autopairs, 'CmdlineEnter'), 'autopairs event must include CmdlineEnter'); \
-check(idx.autopairs ~= nil and idx.autopairs.version == '*', 'autopairs version must be *'); \
-check(idx.autopairs ~= nil and type(idx.autopairs.build) == 'function', 'autopairs.build must be a function'); \
+check(idx.autopairs ~= nil and idx.autopairs.build == nil, 'autopairs must not ship a native build hook'); \
 print(ok and 'LOAD_TRIGGERS_OK' or 'LOAD_TRIGGERS_BAD')" \
     -c 'qall!' 2>&1)"
   if ! grep -q '^LOAD_TRIGGERS_OK$' <<<"${output//$'\r'/}"; then
@@ -1126,9 +1125,9 @@ check_phase_23_lvim_sync_core_plugins_dispatches() {
   # branches are pinned here:
   #
   #   * snapshot present and non-empty -> write it over the user's
-  #     lazy-lock.json, then `lazy.restore()` so the pinned commits are
-  #     checked out. This is the normal path and the reason the snapshot
-  #     exists at all.
+  #     lazy-lock.json, then install + restore + clean so pinned commits
+  #     are checked out and spec-removed plugins are dropped. This is the
+  #     normal path and the reason the snapshot exists at all.
   #   * snapshot missing or empty -> `lazy.sync()`, because there is
   #     nothing to restore to and the user still expects the command to
   #     bring plugins up to date.
@@ -1140,7 +1139,7 @@ check_phase_23_lvim_sync_core_plugins_dispatches() {
   # what made an earlier version of this check report a false failure).
   local cfg_dir output stub
 
-  stub='lua _G.__sync = false; _G.__restore = false; _G.__install = false; package.loaded.lazy = { sync = function() _G.__sync = true end, restore = function() _G.__restore = true end, install = function() _G.__install = true; return { wait = function(_, cb) if cb then cb() end end } end, stats = function() return { count = 0 } end }'
+  stub='lua _G.__sync = false; _G.__restore = false; _G.__install = false; _G.__clean = false; _G.__order = ""; package.loaded.lazy = { sync = function() _G.__sync = true end, restore = function() _G.__order = _G.__order .. "R"; _G.__restore = true end, clean = function() _G.__order = _G.__order .. "C"; _G.__clean = true end, install = function() _G.__order = _G.__order .. "I"; _G.__install = true; return { wait = function(_, cb) if cb then cb() end end } end, stats = function() return { count = 0 } end }'
 
   # Branch 1: the repository's real, non-empty snapshot -> install + restore.
   # INSTALL must flip true as well: lazy.restore() only processes plugins
@@ -1153,10 +1152,10 @@ check_phase_23_lvim_sync_core_plugins_dispatches() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c "$stub" \
     -c 'LvimSyncCorePlugins!' \
-    -c 'lua print("SYNC=" .. tostring(_G.__sync) .. " RESTORE=" .. tostring(_G.__restore) .. " INSTALL=" .. tostring(_G.__install))' \
+    -c 'lua print("SYNC=" .. tostring(_G.__sync) .. " RESTORE=" .. tostring(_G.__restore) .. " INSTALL=" .. tostring(_G.__install) .. " CLEAN=" .. tostring(_G.__clean) .. " ORDER=" .. tostring(_G.__order))' \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^SYNC=false RESTORE=true INSTALL=true$' <<<"${output//$'\r'/}"; then
-    printf 'phase 2.3 LvimSyncCorePlugins did not install+restore from a non-empty snapshot (output: %s)\n' "$output" >&2
+  if ! grep -q '^SYNC=false RESTORE=true INSTALL=true CLEAN=true ORDER=IRC$' <<<"${output//$'\r'/}"; then
+    printf 'phase 2.3 LvimSyncCorePlugins did not install then restore then clean from a non-empty snapshot (output: %s)\n' "$output" >&2
     return 1
   fi
   # The lockfile must have been written with the snapshot's contents.
@@ -1177,9 +1176,9 @@ check_phase_23_lvim_sync_core_plugins_dispatches() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" LUNAVIM_BASE_DIR="$fake_base" nvim --headless -u init.lua \
     -c "$stub" \
     -c 'LvimSyncCorePlugins!' \
-    -c 'lua print("SYNC=" .. tostring(_G.__sync) .. " RESTORE=" .. tostring(_G.__restore) .. " INSTALL=" .. tostring(_G.__install))' \
+    -c 'lua print("SYNC=" .. tostring(_G.__sync) .. " RESTORE=" .. tostring(_G.__restore) .. " INSTALL=" .. tostring(_G.__install) .. " CLEAN=" .. tostring(_G.__clean))' \
     -c 'qall!' 2>&1)"
-  if ! grep -q '^SYNC=true RESTORE=false INSTALL=false$' <<<"${output//$'\r'/}"; then
+  if ! grep -q '^SYNC=true RESTORE=false INSTALL=false CLEAN=false$' <<<"${output//$'\r'/}"; then
     printf 'phase 2.3 LvimSyncCorePlugins did not fall back to lazy.sync on an empty snapshot (output: %s)\n' "$output" >&2
     return 1
   fi
@@ -1366,7 +1365,7 @@ check_phase_24_non_empty_snapshot_restores() {
   set +e
   output="$(LUNAVIM_BASE_DIR="$fake_base" LUNAVIM_CONFIG_DIR="$cfg_dir" \
     nvim --headless -u init.lua \
-    -c 'lua _G.__lvim_restore_called = false; package.loaded.lazy = { sync = function() _G.__lvim_sync_called = true end, restore = function() _G.__lvim_restore_called = true end, install = function() return { wait = function(_, cb) if cb then cb() end end } end, stats = function() return { count = 0 } end }' \
+    -c 'lua _G.__lvim_restore_called = false; package.loaded.lazy = { sync = function() _G.__lvim_sync_called = true end, restore = function() _G.__lvim_restore_called = true end, clean = function() end, install = function() return { wait = function(_, cb) if cb then cb() end end } end, stats = function() return { count = 0 } end }' \
     -c 'LvimSyncCorePlugins!' \
     -c 'lua print("RESTORE=" .. tostring(_G.__lvim_restore_called) .. " LOCK_EXISTS=" .. tostring(vim.uv.fs_stat(vim.env.LUNAVIM_CONFIG_DIR .. "/lazy-lock.json") ~= nil))' \
     -c 'qall!' 2>&1)"
@@ -3969,7 +3968,7 @@ LUA
 }
 
 check_phase_52_setup_pcall_guards_missing() {
-  # Smoke runs with install.missing=false so mini.nvim is not on disk. A
+  # Smoke runs with install.missing=false so mini.comment is not on disk. A
   # regression that dropped the pcall around `require('mini.comment')` would
   # raise the moment lazy fires the comment module's `config` callback on
   # BufReadPost. Force the module unavailable and assert setup() returns
@@ -4212,7 +4211,7 @@ check_phase_52_acceptance_command_literal() {
   #   (a) `package.loaded["mini.comment"]` is stubbed so the comment module
   #       can capture hooks.pre — the smoke harness boots with
   #       `install.missing = false` (LunarVim contract, see
-  #       `lua/lvim/core/plugins.lua`), so mini.nvim is not on disk and the
+  #       `lua/lvim/core/plugins.lua`), so mini.comment is not on disk and the
   #       real lazy `config = setup("comment")` callback never fires.
   #   (b) `lvim.plugins.modules.comment` is force-loaded so its setup runs
   #       even though lazy skipped the plugin.
@@ -4223,7 +4222,7 @@ check_phase_52_acceptance_command_literal() {
   #   (d) `normal Vgcc` drops the `!` from the step text. The bang skips
   #       mappings; Neovim 0.10+'s default `gcc` is itself a mapping (see
   #       `runtime/lua/vim/_defaults.lua`), so `normal! Vgcc` cannot
-  #       produce a comment even with a real mini.nvim install. The grep
+  #       produce a comment even with a real mini.comment install. The grep
   #       below `-F '{/*'` is the verbatim contract from the step.
   # This is the same minimum-perturbation pattern used by phase 4.4's literal
   # acceptance (`check_phase_44_lazydev_literal_acceptance`).
@@ -4279,7 +4278,7 @@ check_phase_53_tsupdate_scheduled_when_treesitter_active() {
   output="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
     -c 'lua _G.__ts_called = false; vim.api.nvim_create_user_command("TSUpdate", function() _G.__ts_called = true end, {})' \
     -c 'lua package.loaded["nvim-treesitter"] = { __stub = true }' \
-    -c 'lua package.loaded.lazy = { sync = function() end, restore = function() end, install = function() return { wait = function(_, cb) if cb then cb() end end } end, stats = function() return { count = 0 } end }' \
+    -c 'lua package.loaded.lazy = { sync = function() end, restore = function() end, clean = function() end, install = function() return { wait = function(_, cb) if cb then cb() end end } end, stats = function() return { count = 0 } end }' \
     -c 'LvimSyncCorePlugins!' \
     -c 'lua vim.wait(500, function() return _G.__ts_called end)' \
     -c 'lua print("TS_CALLED=" .. tostring(_G.__ts_called))' \
@@ -6247,14 +6246,13 @@ check_phase_6_terminal_lazygit_recipe_opts_full_shape() {
 check_phase_6_comment_toggle_drops_plugin() {
   # Phase 6 (mini.comment finalize) acceptance: setting
   #   lvim.builtin.comment.active = false
-  # in user config must cause the mini.nvim core spec entry (whose
+  # in user config must cause the mini.comment core spec entry (whose
   # `enabled = gate("comment")` reads that flag) to be filtered out of
   # `Config.plugins`, so `require('lazy').stats().count` drops by exactly 1
   # versus the baseline. This pins the toggle path end-to-end: spec uses the
   # comment-keyed gate, lazy honors `enabled = false`, and the count delta is
-  # exactly one (no collateral drop from a shared mini.nvim entry serving
-  # multiple sub-modules — if a future step adds another mini.* sub-module
-  # under the same spec entry, this assertion will fail and force the split).
+  # exactly one (mini.pairs is a separate standalone spec entry, so disabling
+  # comments must not drop autopairs).
   local cfg_dir toggle_cfg baseline_out toggled_out baseline_n toggled_n
 
   cfg_dir="$(make_empty_config_dir)"
@@ -6285,15 +6283,15 @@ check_phase_6_comment_toggle_drops_plugin() {
   fi
 }
 
-check_phase_6_comment_toggle_drops_mini_nvim_specifically() {
+check_phase_6_comment_toggle_drops_mini_comment_specifically() {
   # Phase 6 (mini.comment finalize) stronger acceptance: it is not enough that
   # `lazy.stats().count` drops by 1 when `lvim.builtin.comment.active = false`
   # (the sibling `check_phase_6_comment_toggle_drops_plugin`). A regression
   # that cross-mapped gate keys (e.g. swapped `gate("comment")` with another
-  # entry's gate) could still produce a delta of 1 while the actual mini.nvim
+  # entry's gate) could still produce a delta of 1 while the actual mini.comment
   # plugin remains loaded and a different plugin gets dropped instead. Pin
   # the specific identity by scanning `lazy.core.config.plugins` for the
-  # entry whose source URL is `echasnovski/mini.nvim`. With the toggle ON the
+  # entry whose source URL is `echasnovski/mini.comment`. With the toggle ON the
   # entry must be present; with the toggle OFF it must be absent. (lazy keys
   # plugins under their `spec.name`, not by URL, so we scan `plugin.url`
   # rather than indexing — the LunaVim spec sets `name = "comment"` on this
@@ -6302,20 +6300,46 @@ check_phase_6_comment_toggle_drops_mini_nvim_specifically() {
 
   cfg_dir="$(make_empty_config_dir)"
   baseline_out="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
-    -c "lua local has = false; for _, p in pairs(require('lazy.core.config').plugins) do if (p[1] == 'echasnovski/mini.nvim') or (p.url and p.url:match('echasnovski/mini%.nvim')) then has = true; break end end; print('MINI=' .. tostring(has))" \
+    -c "lua local has = false; for _, p in pairs(require('lazy.core.config').plugins) do if (p[1] == 'echasnovski/mini.comment') or (p.url and p.url:match('echasnovski/mini%.comment')) then has = true; break end end; print('MINI=' .. tostring(has))" \
     -c 'qall!' 2>&1)"
   if ! grep -Eq '^MINI=true$' <<<"${baseline_out//$'\r'/}"; then
-    printf 'phase 6 comment toggle: echasnovski/mini.nvim not present in Config.plugins under baseline (output: %s)\n' "$baseline_out" >&2
+    printf 'phase 6 comment toggle: echasnovski/mini.comment not present in Config.plugins under baseline (output: %s)\n' "$baseline_out" >&2
     return 1
   fi
 
   toggle_cfg="$(mktemp -d -p "$SMOKE_TMP_BASE" comment-off-id-XXXXXX)"
   printf 'lvim.builtin.comment.active = false\n' > "$toggle_cfg/config.lua"
   toggled_out="$(LUNAVIM_CONFIG_DIR="$toggle_cfg" nvim --headless -u init.lua \
-    -c "lua local has = false; for _, p in pairs(require('lazy.core.config').plugins) do if (p[1] == 'echasnovski/mini.nvim') or (p.url and p.url:match('echasnovski/mini%.nvim')) then has = true; break end end; print('MINI=' .. tostring(has))" \
+    -c "lua local has = false; for _, p in pairs(require('lazy.core.config').plugins) do if (p[1] == 'echasnovski/mini.comment') or (p.url and p.url:match('echasnovski/mini%.comment')) then has = true; break end end; print('MINI=' .. tostring(has))" \
     -c 'qall!' 2>&1)"
   if ! grep -Eq '^MINI=false$' <<<"${toggled_out//$'\r'/}"; then
-    printf 'phase 6 comment toggle: echasnovski/mini.nvim still present in Config.plugins with comment.active=false (output: %s)\n' "$toggled_out" >&2
+    printf 'phase 6 comment toggle: echasnovski/mini.comment still present in Config.plugins with comment.active=false (output: %s)\n' "$toggled_out" >&2
+    return 1
+  fi
+}
+
+check_phase_6_autopairs_toggle_drops_mini_pairs_specifically() {
+  # Parallel to check_phase_6_comment_toggle_drops_mini_comment_specifically:
+  # flipping `lvim.builtin.autopairs.active = false` must drop the
+  # `echasnovski/mini.pairs` spec entry, not some other gated plugin.
+  local cfg_dir toggle_cfg baseline_out toggled_out
+
+  cfg_dir="$(make_empty_config_dir)"
+  baseline_out="$(LUNAVIM_CONFIG_DIR="$cfg_dir" nvim --headless -u init.lua \
+    -c "lua local has = false; for _, p in pairs(require('lazy.core.config').plugins) do if (p[1] == 'echasnovski/mini.pairs') or (p.url and p.url:match('echasnovski/mini%.pairs')) then has = true; break end end; print('PAIRS=' .. tostring(has))" \
+    -c 'qall!' 2>&1)"
+  if ! grep -Eq '^PAIRS=true$' <<<"${baseline_out//$'\r'/}"; then
+    printf 'phase 6 autopairs toggle: echasnovski/mini.pairs not present in Config.plugins under baseline (output: %s)\n' "$baseline_out" >&2
+    return 1
+  fi
+
+  toggle_cfg="$(mktemp -d -p "$SMOKE_TMP_BASE" autopairs-off-id-XXXXXX)"
+  printf 'lvim.builtin.autopairs.active = false\n' > "$toggle_cfg/config.lua"
+  toggled_out="$(LUNAVIM_CONFIG_DIR="$toggle_cfg" nvim --headless -u init.lua \
+    -c "lua local has = false; for _, p in pairs(require('lazy.core.config').plugins) do if (p[1] == 'echasnovski/mini.pairs') or (p.url and p.url:match('echasnovski/mini%.pairs')) then has = true; break end end; print('PAIRS=' .. tostring(has))" \
+    -c 'qall!' 2>&1)"
+  if ! grep -Eq '^PAIRS=false$' <<<"${toggled_out//$'\r'/}"; then
+    printf 'phase 6 autopairs toggle: echasnovski/mini.pairs still present in Config.plugins with autopairs.active=false (output: %s)\n' "$toggled_out" >&2
     return 1
   fi
 }
@@ -6354,7 +6378,7 @@ check_phase_6_comment_literal_acceptance_require_returns_table() {
   # (indentlines/lualine/bufferline/gitsigns/whichkey/terminal/breadcrumbs):
   #   nvim --headless -u init.lua -c "lua print(type(require('mini.comment')))" \
   #     -c qall! 2>&1 | grep -q table
-  # In the smoke env mini.nvim is not on disk (install.missing = false), so we
+  # In the smoke env mini.comment is not on disk (install.missing = false), so we
   # preload `package.loaded["mini.comment"]` with a fake whose `.setup` is a
   # noop — this isolates the acceptance to the *return type* contract from the
   # parity convention ("require('mini.comment') returns a table") and pins
@@ -6976,11 +7000,11 @@ check_phase_6_indentlines_toggle_drops_indentlines_specifically() {
 }
 
 check_phase_6_comment_spec_uses_comment_active_gate() {
-  # Phase 6 step 1 (literal): the lazy spec entry for `echasnovski/mini.nvim`
+  # Phase 6 step 1 (literal): the lazy spec entry for `echasnovski/mini.comment`
   # must gate on `lvim.builtin.comment.active`. The gate is wired via the
   # spec.lua `gate("comment")` helper that closes over the literal string
   # "comment" and reads `_G.lvim.builtin.comment.active`. Pin both: (a) the
-  # entry exists and resolves to mini.nvim, and (b) flipping
+  # entry exists and resolves to mini.comment, and (b) flipping
   # `lvim.builtin.comment.active` at runtime flips the entry's `enabled()`
   # return value. A regression that re-keyed the gate (e.g. `gate("mini")`)
   # would leave `enabled()` insensitive to the comment flag — caught here.
@@ -6991,7 +7015,7 @@ check_phase_6_comment_spec_uses_comment_active_gate() {
     -c "lua \
 local s = require('lvim.plugins.spec'); \
 local entry = nil; \
-for _, p in ipairs(s) do if p[1] == 'echasnovski/mini.nvim' then entry = p end end; \
+for _, p in ipairs(s) do if p[1] == 'echasnovski/mini.comment' then entry = p end end; \
 local has_entry = entry ~= nil; \
 local on, off = nil, nil; \
 if has_entry and type(entry.enabled) == 'function' then \
@@ -7001,7 +7025,7 @@ end; \
 print('GATE', has_entry, on, off)" \
     -c 'qall!' 2>&1)"
   if ! grep -Eq '^GATE[[:space:]]+true[[:space:]]+true[[:space:]]+false$' <<<"${output//$'\r'/}"; then
-    printf 'phase 6 comment: mini.nvim spec entry missing or not gated on lvim.builtin.comment.active (output: %s)\n' "$output" >&2
+    printf 'phase 6 comment: mini.comment spec entry missing or not gated on lvim.builtin.comment.active (output: %s)\n' "$output" >&2
     return 1
   fi
 }
@@ -7425,7 +7449,8 @@ run_check check_phase_6_indentlines_literal_acceptance_require_returns_table
 run_check check_phase_6_indentlines_toggle_drops_indentlines_specifically
 run_check check_phase_6_comment_spec_uses_comment_active_gate
 run_check check_phase_6_comment_toggle_drops_plugin
-run_check check_phase_6_comment_toggle_drops_mini_nvim_specifically
+run_check check_phase_6_comment_toggle_drops_mini_comment_specifically
+run_check check_phase_6_autopairs_toggle_drops_mini_pairs_specifically
 run_check check_phase_6_comment_setup_does_not_mutate_builtin
 run_check check_phase_6_comment_literal_acceptance_require_returns_table
 run_check check_phase_6_comment_module_dispatches_through_mini_comment_require

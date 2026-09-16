@@ -14,9 +14,14 @@ Behavior of `:LvimSyncCorePlugins`:
 
 - If `snapshots/default.json` is **non-empty**, the command copies it onto
   the user's `<config>/lazy-lock.json` (after a confirmation prompt
-  unless invoked as `:LvimSyncCorePlugins!`) and then runs
-  `require('lazy').restore()` so every plugin checks out the pinned
-  commit.
+  unless invoked as `:LvimSyncCorePlugins!`), removes any core checkout
+  whose git origin no longer matches the spec URL, then runs install,
+  restore, and clean in sequence so every plugin checks out the pinned
+  commit and spec-removed plugins are dropped. Declining the overwrite
+  keeps your pins, except those origin-mismatched names — they take the
+  snapshot pin and are re-cloned. The lockfile is re-applied after
+  install because lazy.nvim would otherwise rewrite pins from the old
+  checkouts.
 - If `snapshots/default.json` is **empty** (`{}`, the initial state), the
   command falls back to `require('lazy').sync()` — install/update against
   the spec's default branches with no pin.
